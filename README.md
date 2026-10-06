@@ -4,13 +4,13 @@ Serviço que entrega **produtos** (resultado de um solver, por exemplo um token)
 
 Roda na AWS em várias tasks atrás de um balanceador, então o estado compartilhado fica no Redis.
 
-> Estado atual: projeto em construção. As peças existem, mas o `main()` ainda está vazio — nada é iniciado ao rodar.
+> Ainda em construção. As peças já existem, mas o `main()` está vazio, então nada sobe ao rodar.
 
 ## Conceitos
 
-- **Chave (`keys.Key`)** — `{Name, Client}`, escrita como `nome|cliente`. `Name` é livre, definido por quem usa o sistema.
-- **Solver** — gera um produto para uma chave. Uma chave pode ter vários solvers, cada um com um peso (0 desativa).
-- **Produto** — o que é entregue: id, chave, solver que gerou, horário, tempo de geração e o valor.
+- **Chave (`keys.Key`)**: `{Name, Client}`, escrita como `nome|cliente`. `Name` é livre, definido por quem usa o sistema.
+- **Solver**: gera um produto para uma chave. Uma chave pode ter vários solvers, cada um com um peso (0 desativa).
+- **Produto**: o que é entregue, ou seja, id, chave, solver que gerou, horário, tempo de geração e o valor.
 
 ## Fluxo do `GetProduct(key)`
 
@@ -23,8 +23,8 @@ Roda na AWS em várias tasks atrás de um balanceador, então o estado compartil
 
 Definida por `SolverConfig.adaptiveChoice`:
 
-- **Peso fixo** — sorteio proporcional ao peso (os pesos não precisam somar 100).
-- **Adaptativa** — usa as métricas de cada solver: qualidade do produto, taxa de sucesso, velocidade e carga atual, multiplicadas pelo peso. Cada solver fica entre 5% e 90% do tráfego. Sem métricas, segue os pesos.
+- **Peso fixo**: sorteio proporcional ao peso (os pesos não precisam somar 100).
+- **Adaptativa**: usa as métricas de cada solver (qualidade do produto, taxa de sucesso, velocidade e carga atual) multiplicadas pelo peso. Cada solver fica entre 5% e 90% do tráfego. Sem métricas, segue os pesos.
 
 ### Taxa de requisições
 
@@ -42,9 +42,9 @@ Definida por `SolverConfig.adaptiveChoice`:
 
 ### `external`
 
-- `BackOffice[T]` — `Get` e `Post` em JSON, com token Bearer opcional. Todos compartilham um único cliente HTTP ajustado para muitas requisições em paralelo.
-- `SessionManager[T]` — `Save(ctx, key, valor)` faz POST e `Get(ctx, key)` faz GET no path da chave.
-- `Routes` — mapa chave → path, carregado de um JSON, para adicionar chaves sem deploy:
+- `BackOffice[T]`: `Get` e `Post` em JSON, com token Bearer opcional. Todos compartilham um único cliente HTTP ajustado para muitas requisições em paralelo.
+- `SessionManager[T]`: `Save(ctx, key, valor)` faz POST e `Get(ctx, key)` faz GET no path da chave.
+- `Routes`: mapa de chave para path, carregado de um JSON. Assim dá para adicionar chaves sem precisar de deploy:
 
 ```json
 {

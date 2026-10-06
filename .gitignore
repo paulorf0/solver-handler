@@ -32,7 +32,6 @@ go.work.sum
 .idea/
 .vscode/
 
-CLAUDE.md
 
 # Local environment (copy from the .example files)
 docker-compose.yml
