@@ -11,20 +11,32 @@ type fakeSolver struct {
 	calls int
 	token any
 	err   error
+	stats SolverStats
 }
 
-func (f *fakeSolver) Key() Key { return f.key }
+func (f *fakeSolver) GetKey() Key { return f.key }
+
+func (f *fakeSolver) GetWeight() int { return 0 }
+
+func (f *fakeSolver) GetName() string { return string(f.key) }
+
+func (f *fakeSolver) GetStatistic() *SolverStats { return &f.stats }
+
+func (f *fakeSolver) GetInflights() int { return 0 }
+func (f *fakeSolver) AddInflights()     {}
+func (f *fakeSolver) SubInflights()     {}
 
 func (f *fakeSolver) Solve() (any, error) {
 	f.calls++
 	return f.token, f.err
 }
 
-func newBuckets(key Key, solver Solver[any]) (*BucketHandler, *Queue) {
+func newBuckets(key Key, solver SolverInterface[any]) (*BucketHandler, *Queue) {
 	q := fifo.New[Product[any]]()
 	b := &BucketHandler{
 		queues:  map[Key]*Queue{key: q},
-		solvers: map[Key]Solver[any]{key: solver},
+		solvers: map[Key][]SolverInterface[any]{key: {solver}},
+		stats:   map[Key]*KeyStats{key: {}},
 	}
 	return b, q
 }
@@ -109,7 +121,7 @@ func TestTryGetSolver(t *testing.T) {
 	b, _ := newBuckets("a", solver)
 
 	got, err := b.TryGetSolver("a")
-	if err != nil || got != Solver[any](solver) {
+	if err != nil || got != SolverInterface[any](solver) {
 		t.Errorf("got = %v, err = %v; quer %v, nil", got, err, solver)
 	}
 	if _, err := b.TryGetSolver("x"); err == nil {
@@ -150,10 +162,10 @@ func TestNewBucketHandler(t *testing.T) {
 }
 
 func TestNewBaseSolver(t *testing.T) {
-	s := NewBaseSolver("latam|cli")
+	s := NewBaseSolver("latam", "latam|cli", 0)
 
-	if s.Key() != "latam|cli" {
-		t.Errorf("Key() = %q, quer %q", s.Key(), "latam|cli")
+	if s.GetKey() != "latam|cli" {
+		t.Errorf("GetKey() = %q, quer %q", s.GetKey(), "latam|cli")
 	}
 }
 
@@ -167,7 +179,8 @@ func TestChaveParaSolver(t *testing.T) {
 			"latam|cli": fifo.New[Product[any]](),
 			"gol|cli":   fifo.New[Product[any]](),
 		},
-		solvers: map[Key]Solver[any]{"latam|cli": latam, "gol|cli": gol},
+		solvers: map[Key][]SolverInterface[any]{"latam|cli": {latam}, "gol|cli": {gol}},
+		stats:   map[Key]*KeyStats{"latam|cli": {}, "gol|cli": {}},
 	}
 
 	got, err := b.GetProduct("gol|cli")
@@ -189,15 +202,16 @@ func TestSolverRegistradoTemASuaChave(t *testing.T) {
 	if err != nil {
 		t.Fatalf("erro inesperado: %v", err)
 	}
-	if solver.Key() != "latam|cli" {
-		t.Errorf("Key() = %q, quer %q", solver.Key(), "latam|cli")
+	if solver.GetKey() != "latam|cli" {
+		t.Errorf("GetKey() = %q, quer %q", solver.GetKey(), "latam|cli")
 	}
 }
 
 func TestFilasIsoladasPorChave(t *testing.T) {
 	b, qa := newBuckets("a", &fakeSolver{key: "a"})
 	b.queues["b"] = fifo.New[Product[any]]()
-	b.solvers["b"] = &fakeSolver{key: "b", token: "solver-b"}
+	b.solvers["b"] = []SolverInterface[any]{&fakeSolver{key: "b", token: "solver-b"}}
+	b.stats["b"] = &KeyStats{}
 	qa.Push(Product[any]{id: "da-fila-a"})
 
 	got, err := b.GetProduct("b")
@@ -218,13 +232,13 @@ type embedSolver struct {
 	BaseSolver
 }
 
-func (embedSolver) Solve() (any, error) { return nil, nil }
+func (*embedSolver) Solve() (any, error) { return nil, nil }
 
 func TestBaseSolver_Key(t *testing.T) {
 	s := &embedSolver{BaseSolver{key: "latam|cli"}}
 
-	var _ Solver[any] = s // embutir BaseSolver já satisfaz Key()
-	if s.Key() != "latam|cli" {
-		t.Errorf("Key() = %q, quer %q", s.Key(), "latam|cli")
+	var _ SolverInterface[any] = s // embutir BaseSolver já satisfaz tudo menos Solve()
+	if s.GetKey() != "latam|cli" {
+		t.Errorf("GetKey() = %q, quer %q", s.GetKey(), "latam|cli")
 	}
 }
