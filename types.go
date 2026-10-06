@@ -1,8 +1,13 @@
 package main
 
-import "solver-handler/fifo"
+import (
+	"solver-handler/keys"
+)
 
 var Version = "v0.1"
 
-type Key string
-type Queue = fifo.Queue[Product[any]]
+type Key = keys.Key
+
+type SolverConfig struct {
+	adaptiveChoice bool
+}

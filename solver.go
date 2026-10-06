@@ -25,8 +25,8 @@ type BaseSolver struct {
 	stats SolverStats
 }
 
-func NewBaseSolver(name, key string, weight uint8) BaseSolver {
-	return BaseSolver{name: name, key: Key(key), weight: weight}
+func NewBaseSolver(name string, key Key, weight uint8) BaseSolver {
+	return BaseSolver{name: name, key: key, weight: weight}
 }
 
 func (b *BaseSolver) GetName() string            { return b.name }
@@ -42,5 +42,5 @@ func (b *BaseSolver) SubInflights() {
 	}
 }
 
-// registry maps the full key ("something|client") to the solver that handles it.
+// registry maps each key to the solvers that handle it.
 var registry = map[Key][]SolverInterface[any]{}

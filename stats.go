@@ -3,48 +3,14 @@ package main
 import (
 	"math"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
 const (
-	bucketSize  = time.Minute
-	bucketCount = 120 // 2 hours of history
-
-	shortWindow  = 15 * time.Minute
-	mediumWindow = time.Hour
-	longWindow   = 2 * time.Hour
-
 	halfLife   = 30 * time.Minute // solver samples lose half their weight every halfLife
 	minDecayed = 0.01             // decayed counters below this are zeroed
 )
-
-// ring is a circular buffer of time buckets of bucketSize each.
-type ring[T any] struct {
-	starts [bucketCount]time.Time
-	data   [bucketCount]T
-}
-
-// at returns the bucket of t, resetting it if it still holds an older period.
-func (r *ring[T]) at(t time.Time) *T {
-	start := t.Truncate(bucketSize)
-	i := int(start.Unix()/int64(bucketSize/time.Second)) % bucketCount
-	if !r.starts[i].Equal(start) {
-		var zero T
-		r.starts[i] = start
-		r.data[i] = zero
-	}
-	return &r.data[i]
-}
-
-// each calls fn for every bucket inside the window that ends at now.
-func (r *ring[T]) each(now time.Time, window time.Duration, fn func(*T)) {
-	from := now.Truncate(bucketSize).Add(-window)
-	for i := range r.data {
-		if r.starts[i].After(from) && !r.starts[i].After(now) {
-			fn(&r.data[i])
-		}
-	}
-}
 
 // TODO: This project will run on AWS with more than one task behind a load balancer.
 // Should this data live in a persistent Redis instead of a local variable?
@@ -54,10 +20,6 @@ type SolverStats struct {
 	updatedAt time.Time
 
 	counters solverCounters
-
-	lastSuccessAt time.Time
-	lastFailureAt time.Time
-	lastErr       error
 }
 
 type solverCounters struct {
@@ -95,13 +57,10 @@ func (s *SolverStats) AddGeneration(now time.Time, elapsed time.Duration, err er
 	s.decay(now)
 	if err != nil {
 		s.counters.genFailure++
-		s.lastFailureAt = now
-		s.lastErr = err
 		return
 	}
 	s.counters.genSuccess++
 	s.counters.genElapsed += elapsed.Seconds()
-	s.lastSuccessAt = now
 }
 
 func (s *SolverStats) AddUsage(now time.Time, success bool) {
@@ -125,43 +84,12 @@ func (s *SolverStats) Snapshot(now time.Time) solverCounters {
 	return s.counters
 }
 
-type demandBucket struct {
-	requests  int64
-	stockHits int64 // requests served from the queue without solving
-}
-
-// KeyStats holds the demand measurements of one key, used to size the stock of products.
+// KeyStats holds the global request counter state of one key.
 type KeyStats struct {
-	mu      sync.Mutex
-	buckets ring[demandBucket]
-}
+	mu sync.Mutex
 
-type KeySummary struct {
-	requests      int64
-	stockHits     int64
-	ratePerMinute float64
-}
+	failedIncr atomic.Int64 // global increments that failed to reach Redis
 
-func (k *KeyStats) AddRequest(at time.Time, stockHit bool) {
-	k.mu.Lock()
-	defer k.mu.Unlock()
-
-	b := k.buckets.at(at)
-	b.requests++
-	if stockHit {
-		b.stockHits++
-	}
-}
-
-func (k *KeyStats) Window(now time.Time, window time.Duration) KeySummary {
-	k.mu.Lock()
-	defer k.mu.Unlock()
-
-	var sum KeySummary
-	k.buckets.each(now, window, func(b *demandBucket) {
-		sum.requests += b.requests
-		sum.stockHits += b.stockHits
-	})
-	sum.ratePerMinute = float64(sum.requests) / window.Minutes()
-	return sum
+	lastCount int64     // global counter at the last measure, guarded by mu
+	lastAt    time.Time // when lastCount was measured
 }
