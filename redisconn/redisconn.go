@@ -4,15 +4,19 @@ package redisconn
 
 import (
 	"context"
+	"errors"
+	"os"
 	"time"
 
 	"github.com/redis/go-redis/v9"
 )
 
-const addr = "localhost:6379"
-
-// Connect cria o cliente e confirma a conexão com um PING.
+// Connect reads the address from REDIS_ADDR, creates the client and checks it with a PING.
 func Connect(ctx context.Context) (*redis.Client, error) {
+	addr := os.Getenv("REDIS_ADDR")
+	if addr == "" {
+		return nil, errors.New("variável REDIS_ADDR não definida")
+	}
 	client := redis.NewClient(&redis.Options{
 		Addr:        addr,
 		DialTimeout: 5 * time.Second,

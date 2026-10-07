@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"solver-handler/keys"
-	"strings"
 )
 
 // Routes maps each Key to its path in an external system. It comes from a JSON like
@@ -19,20 +18,19 @@ func (r *Routes) UnmarshalJSON(data []byte) error {
 	}
 	out := make(Routes, len(raw))
 	for k, path := range raw {
-		// Split on the last "|", since Name is free and may contain it.
-		i := strings.LastIndex(k, "|")
-		if i < 0 {
-			return fmt.Errorf("chave %q fora do padrão chave|cliente", k)
+		key, err := keys.Parse(k)
+		if err != nil {
+			return err
 		}
-		out[keys.Key{Name: k[:i], Client: k[i+1:]}] = path
+		out[key] = path
 	}
 	*r = out
 	return nil
 }
 
-// SessionManager is a BackOffice that saves and reads values on the path that Routes gives for each key.
+// SessionManager is a External that saves and reads values on the path that Routes gives for each key.
 type SessionManager[T any] struct {
-	*BackOffice[T]
+	*External[T]
 	routes Routes
 }
 
@@ -41,7 +39,7 @@ func NewSessionManager[T any](rawURL string, token *string, routes Routes) (*Ses
 	if err != nil {
 		return nil, err
 	}
-	return &SessionManager[T]{BackOffice: b, routes: routes}, nil
+	return &SessionManager[T]{External: b, routes: routes}, nil
 }
 
 // Save posts value as JSON to the path of key.
@@ -54,14 +52,14 @@ func (s *SessionManager[T]) Save(ctx context.Context, key keys.Key, value any) (
 	return s.Post(ctx, path, value)
 }
 
-// Get fetches the value on the path of key. It hides BackOffice.Get, which takes a path.
+// Get fetches the value on the path of key. It hides External.Get, which takes a path.
 func (s *SessionManager[T]) Get(ctx context.Context, key keys.Key) (T, error) {
 	path, err := s.route(key)
 	if err != nil {
 		var out T
 		return out, err
 	}
-	return s.BackOffice.Get(ctx, path)
+	return s.External.Get(ctx, path)
 }
 
 func (s *SessionManager[T]) route(key keys.Key) (string, error) {

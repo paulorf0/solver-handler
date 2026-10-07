@@ -6,17 +6,18 @@ import (
 	"time"
 )
 
+// TODO: Essas métricas precisam vir de um sistema externo. Um Solver pode ter um teto de geração concorrente que consegue fazer.
 const (
 	priorSamples   = 2.0  // fake successes and failures added to every rate
-	minShare       = 0.05 // minimum traffic share, so a bad solver keeps being tested
-	maxShare       = 0.90 // maximum traffic share, so no solver takes everything
+	minShare       = 0.05 // minimum traffic share, so a bad Solver keeps being tested
+	maxShare       = 0.90 // maximum traffic share, so no Solver takes everything
 	minSpeed       = 0.5
 	maxSpeed       = 2.0
-	solverCapacity = 10.0 // inflights at which the load factor halves
+	solverCapacity = 10.0 // inflights At which the load factor halves
 	neutralScore   = 0.25 // score with no samples: 0.5 × 0.5
 )
 
-// PickSolver draws a solver by its adaptive score. Solvers with weight 0 are disabled.
+// PickSolver draws a Solver by its adaptive score. Solvers with weight 0 are disabled.
 func PickSolver(solvers []SolverInterface[any]) SolverInterface[any] {
 	pool := make([]SolverInterface[any], 0, len(solvers))
 	for _, s := range solvers {

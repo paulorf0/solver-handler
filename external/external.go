@@ -12,21 +12,21 @@ import (
 	"time"
 )
 
-// BackOffice talks JSON over HTTP to an external system whose resource is T.
-type BackOffice[T any] struct {
+// External talks JSON over HTTP to an external system whose resource is T.
+type External[T any] struct {
 	url   url.URL
 	token *string
 }
 
-func New[T any](rawURL string, token *string) (*BackOffice[T], error) {
+func New[T any](rawURL string, token *string) (*External[T], error) {
 	u, err := url.Parse(rawURL)
 	if err != nil {
 		return nil, fmt.Errorf("url do backoffice inválida: %w", err)
 	}
-	return &BackOffice[T]{url: *u, token: token}, nil
+	return &External[T]{url: *u, token: token}, nil
 }
 
-// client is shared by every BackOffice so all of them reuse one connection pool.
+// client is shared by every External so all of them reuse one connection pool.
 var client = &http.Client{
 	Timeout: 15 * time.Second,
 	Transport: &http.Transport{
@@ -48,12 +48,12 @@ var client = &http.Client{
 }
 
 // Get fetches url/path and decodes the JSON response into T.
-func (b *BackOffice[T]) Get(ctx context.Context, path string) (T, error) {
+func (b *External[T]) Get(ctx context.Context, path string) (T, error) {
 	return b.do(ctx, http.MethodGet, path, nil)
 }
 
 // Post sends body as JSON to url/path and decodes the JSON response into T.
-func (b *BackOffice[T]) Post(ctx context.Context, path string, body any) (T, error) {
+func (b *External[T]) Post(ctx context.Context, path string, body any) (T, error) {
 	data, err := json.Marshal(body)
 	if err != nil {
 		var out T
@@ -63,7 +63,7 @@ func (b *BackOffice[T]) Post(ctx context.Context, path string, body any) (T, err
 }
 
 // do sends the request and decodes the JSON response into T. A nil body sends none.
-func (b *BackOffice[T]) do(ctx context.Context, method, path string, body []byte) (T, error) {
+func (b *External[T]) do(ctx context.Context, method, path string, body []byte) (T, error) {
 	var out T
 
 	var reader io.Reader

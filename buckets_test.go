@@ -9,8 +9,8 @@ var (
 	keyA     = Key{Name: "a", Client: "cli"}
 	keyB     = Key{Name: "b", Client: "cli"}
 	keyOutra = Key{Name: "outra", Client: "cli"}
-	keyLatam = Key{Name: "latam", Client: "cli"}
-	keyGol   = Key{Name: "gol", Client: "cli"}
+	keyAlfa  = Key{Name: "alfa", Client: "cli"}
+	keyBeta  = Key{Name: "beta", Client: "cli"}
 )
 
 type fakeSolver struct {
@@ -33,7 +33,7 @@ func (f *fakeSolver) GetInflights() int { return 0 }
 func (f *fakeSolver) AddInflights()     {}
 func (f *fakeSolver) SubInflights()     {}
 
-func (f *fakeSolver) Solve() (any, error) {
+func (f *fakeSolver) Solve(Params) (any, error) {
 	f.calls++
 	return f.token, f.err
 }
@@ -46,21 +46,21 @@ func newBuckets(key Key, solver SolverInterface[any]) *BucketHandler {
 }
 
 func TestGetProduct_SemEstoqueResolveNaHora(t *testing.T) {
-	solver := &fakeSolver{key: keyA, token: "solver"}
+	solver := &fakeSolver{key: keyA, token: "Solver"}
 	b := newBuckets(keyA, solver)
 
-	got, err := b.GetProduct(keyA)
+	got, err := b.GetProduct(Request{Key: keyA})
 	if err != nil {
 		t.Fatalf("erro inesperado: %v", err)
 	}
-	if got.token != "solver" {
-		t.Errorf("token = %v, quer %q", got.token, "solver")
+	if got.Token != "Solver" {
+		t.Errorf("Token = %v, quer %q", got.Token, "Solver")
 	}
-	if got.id != GetHash(keyA) || got.key != keyA {
-		t.Errorf("id = %q, key = %q; quer %q, %q", got.id, got.key, GetHash(keyA), "a")
+	if got.Id != GetHash(keyA) || got.Key != keyA {
+		t.Errorf("Id = %q, Key = %q; quer %q, %q", got.Id, got.Key, GetHash(keyA), "a")
 	}
 	if solver.calls != 1 {
-		t.Errorf("solver chamado %d vezes, quer 1", solver.calls)
+		t.Errorf("Solver chamado %d vezes, quer 1", solver.calls)
 	}
 }
 
@@ -68,7 +68,7 @@ func TestGetProduct_ErroDoSolver(t *testing.T) {
 	boom := errors.New("boom")
 	b := newBuckets(keyA, &fakeSolver{key: keyA, err: boom})
 
-	_, err := b.GetProduct(keyA)
+	_, err := b.GetProduct(Request{Key: keyA})
 	if !errors.Is(err, boom) {
 		t.Errorf("err = %v, quer %v", err, boom)
 	}
@@ -77,7 +77,7 @@ func TestGetProduct_ErroDoSolver(t *testing.T) {
 func TestGetProduct_ChaveInexistente(t *testing.T) {
 	b := newBuckets(keyA, &fakeSolver{key: keyA})
 
-	if _, err := b.GetProduct(keyOutra); err == nil {
+	if _, err := b.GetProduct(Request{Key: keyOutra}); err == nil {
 		t.Error("quer erro para chave inexistente")
 	}
 }
@@ -86,8 +86,8 @@ func TestGetProduct_SemSolver(t *testing.T) {
 	b := newBuckets(keyA, &fakeSolver{key: keyA})
 	delete(b.solvers, keyA)
 
-	if _, err := b.GetProduct(keyA); err == nil {
-		t.Error("quer erro para chave sem solver e sem estoque")
+	if _, err := b.GetProduct(Request{Key: keyA}); err == nil {
+		t.Error("quer erro para chave sem Solver e sem estoque")
 	}
 }
 
@@ -107,10 +107,10 @@ func TestTryGetSolver(t *testing.T) {
 // --- campos do BucketHandler ---
 
 func TestBucketHandler_Campos(t *testing.T) {
-	b := newBuckets(keyLatam, &fakeSolver{key: keyLatam})
+	b := newBuckets(keyAlfa, &fakeSolver{key: keyAlfa})
 
-	if len(b.solvers) != 1 || b.solvers[keyLatam] == nil {
-		t.Errorf("solvers = %v, quer só o solver de %q", b.solvers, keyLatam)
+	if len(b.solvers) != 1 || b.solvers[keyAlfa] == nil {
+		t.Errorf("solvers = %v, quer só o Solver de %q", b.solvers, keyAlfa)
 	}
 	if b.redis != nil {
 		t.Error("redis deveria ser nil num handler montado sem conexão")
@@ -131,44 +131,44 @@ func TestNewBucketHandler(t *testing.T) {
 }
 
 func TestNewBaseSolver(t *testing.T) {
-	s := NewBaseSolver("latam", keyLatam, 0)
+	s := NewBaseSolver("alfa", keyAlfa, 0)
 
-	if s.GetKey() != keyLatam {
-		t.Errorf("GetKey() = %q, quer %q", s.GetKey(), keyLatam)
+	if s.GetKey() != keyAlfa {
+		t.Errorf("GetKey() = %q, quer %q", s.GetKey(), keyAlfa)
 	}
 }
 
-// --- chave -> solver ---
+// --- chave -> Solver ---
 
 func TestChaveParaSolver(t *testing.T) {
-	latam := &fakeSolver{key: keyLatam, token: "token-latam"}
-	gol := &fakeSolver{key: keyGol, token: "token-gol"}
+	alfa := &fakeSolver{key: keyAlfa, token: "Token-alfa"}
+	beta := &fakeSolver{key: keyBeta, token: "Token-beta"}
 	b := &BucketHandler{
-		solvers: map[Key][]SolverInterface[any]{keyLatam: {latam}, keyGol: {gol}},
-		stats:   map[Key]*KeyStats{keyLatam: {}, keyGol: {}},
+		solvers: map[Key][]SolverInterface[any]{keyAlfa: {alfa}, keyBeta: {beta}},
+		stats:   map[Key]*KeyStats{keyAlfa: {}, keyBeta: {}},
 	}
 
-	got, err := b.GetProduct(keyGol)
+	got, err := b.GetProduct(Request{Key: keyBeta})
 	if err != nil {
 		t.Fatalf("erro inesperado: %v", err)
 	}
-	if got.token != "token-gol" || got.key != keyGol {
-		t.Errorf("token = %v, key = %q; quer %q, %q", got.token, got.key, "token-gol", keyGol)
+	if got.Token != "Token-beta" || got.Key != keyBeta {
+		t.Errorf("Token = %v, Key = %q; quer %q, %q", got.Token, got.Key, "Token-beta", keyBeta)
 	}
-	if gol.calls != 1 || latam.calls != 0 {
-		t.Errorf("calls gol = %d, latam = %d; quer 1, 0", gol.calls, latam.calls)
+	if beta.calls != 1 || alfa.calls != 0 {
+		t.Errorf("calls beta = %d, alfa = %d; quer 1, 0", beta.calls, alfa.calls)
 	}
 }
 
 func TestSolverRegistradoTemASuaChave(t *testing.T) {
-	b := newBuckets(keyLatam, &fakeSolver{key: keyLatam})
+	b := newBuckets(keyAlfa, &fakeSolver{key: keyAlfa})
 
-	solver, err := b.TryGetSolver(keyLatam)
+	solver, err := b.TryGetSolver(keyAlfa)
 	if err != nil {
 		t.Fatalf("erro inesperado: %v", err)
 	}
-	if solver.GetKey() != keyLatam {
-		t.Errorf("GetKey() = %q, quer %q", solver.GetKey(), keyLatam)
+	if solver.GetKey() != keyAlfa {
+		t.Errorf("GetKey() = %q, quer %q", solver.GetKey(), keyAlfa)
 	}
 }
 
@@ -178,13 +178,13 @@ type embedSolver struct {
 	BaseSolver
 }
 
-func (*embedSolver) Solve() (any, error) { return nil, nil }
+func (*embedSolver) Solve(Params) (any, error) { return nil, nil }
 
 func TestBaseSolver_Key(t *testing.T) {
-	s := &embedSolver{BaseSolver{key: keyLatam}}
+	s := &embedSolver{BaseSolver{key: keyAlfa}}
 
 	var _ SolverInterface[any] = s // embutir BaseSolver já satisfaz tudo menos Solve()
-	if s.GetKey() != keyLatam {
-		t.Errorf("GetKey() = %q, quer %q", s.GetKey(), keyLatam)
+	if s.GetKey() != keyAlfa {
+		t.Errorf("GetKey() = %q, quer %q", s.GetKey(), keyAlfa)
 	}
 }

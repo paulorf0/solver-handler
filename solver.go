@@ -12,12 +12,12 @@ type SolverInterface[T any] interface {
 	AddInflights()
 	SubInflights()
 
-	Solve() (T, error)
+	Solve(params Params) (T, error) // params: client data from Request, may be empty
 }
 
 // BaseSolver is the "parent" struct: concrete solvers embed it and only implement Solve.
 type BaseSolver struct {
-	name      string // identifies the solver among the solvers of the same key
+	name      string // identifies the Solver among the solvers of the same key
 	key       Key
 	weight    uint8        // In percent, 0 - 100 %
 	inflights atomic.Int32 // Quantity of product currently being generated.
@@ -42,5 +42,5 @@ func (b *BaseSolver) SubInflights() {
 	}
 }
 
-// registry maps each key to the solvers that handle it.
+// registry maps each Key to the solvers that handle it.
 var registry = map[Key][]SolverInterface[any]{}

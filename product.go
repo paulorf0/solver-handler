@@ -6,14 +6,15 @@ import (
 )
 
 type Product[T any] struct {
-	id     string
-	key    Key
-	solver string // name of the solver that generated it, used by ReportUsage
+	Id     string
+	Key    Key
+	Solver string // name of the Solver that generated it, used by ReportUsage
 
-	at      time.Time
-	elapsed int64
+	At      time.Time
+	Elapsed int64
 
-	token T
+	Token T
+	TTL   TTL
 }
 
 func GetHash(key Key) string {
@@ -21,9 +22,9 @@ func GetHash(key Key) string {
 	return fixedHash
 }
 
-func NewProductBySolve[T any](key Key, solver SolverInterface[T]) (Product[any], error) {
+func NewProductBySolve[T any](key Key, solver SolverInterface[T], params Params) (Product[any], error) {
 	now := time.Now()
-	token, err := solver.Solve()
+	token, err := solver.Solve(params)
 	elapsed := time.Since(now)
 	solver.GetStatistic().AddGeneration(time.Now(), elapsed, err)
 	if err != nil {
@@ -32,7 +33,7 @@ func NewProductBySolve[T any](key Key, solver SolverInterface[T]) (Product[any],
 
 	hash := GetHash(key)
 
-	prod := Product[any]{id: hash, key: key, solver: solver.GetName(), at: now, elapsed: int64(elapsed), token: token}
+	prod := Product[any]{Id: hash, Key: key, Solver: solver.GetName(), At: now, Elapsed: int64(elapsed), Token: token}
 
 	return prod, nil
 }
