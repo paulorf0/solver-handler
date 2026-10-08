@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"solver-handler/keys"
+	"sync/atomic"
 )
 
 // Routes maps each Key to its path in an external system. It comes from a JSON like
@@ -38,7 +39,7 @@ type PoolStats interface {
 // SessionManager is a External that saves and reads values on the path that Routes gives for each key.
 type SessionManager[T any] struct {
 	*External[T]
-	routes Routes
+	routes atomic.Pointer[Routes] // replaced whole by SetRoutes
 	pool   PoolStats
 }
 
@@ -47,7 +48,14 @@ func NewSessionManager[T any](rawURL string, token *string, routes Routes, pool 
 	if err != nil {
 		return nil, err
 	}
-	return &SessionManager[T]{External: b, routes: routes, pool: pool}, nil
+	s := &SessionManager[T]{External: b, pool: pool}
+	s.SetRoutes(routes)
+	return s, nil
+}
+
+// SetRoutes replaces the routes. Safe while Get and Save run.
+func (s *SessionManager[T]) SetRoutes(routes Routes) {
+	s.routes.Store(&routes)
 }
 
 // Len returns the pool size of key, as the PoolStats given on creation says.
@@ -81,7 +89,11 @@ func (s *SessionManager[T]) Get(ctx context.Context, key keys.Key) (T, error) {
 }
 
 func (s *SessionManager[T]) route(key keys.Key) (string, error) {
-	path, ok := s.routes[key]
+	routes := s.routes.Load()
+	if routes == nil {
+		return "", fmt.Errorf("nenhuma rota registrada para a chave %s", key)
+	}
+	path, ok := (*routes)[key]
 	if !ok {
 		return "", fmt.Errorf("nenhuma rota registrada para a chave %s", key)
 	}

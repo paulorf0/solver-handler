@@ -16,14 +16,20 @@ import (
 )
 
 const (
-	stockTick       = time.Second      // refill period of every task, also the brake window
-	defaultCoverage = 2 * time.Second  // coverage while the generation time is not measured
-	genLife         = 30 * time.Second // an inflight mark lasts this long if its task dies mid generation
+	stockTick       = time.Second       // refill period of every task, also the brake window
+	ordersTTL       = 3 * stockTick / 2 // queued orders lapse if no leader renews them
+	defaultCoverage = 2 * time.Second   // coverage while the generation time is not measured
+	genLife         = 30 * time.Second  // an inflight mark lasts this long if its task dies mid generation
 	latencySigmas   = 2
 	rateTauUp       = 2 * time.Second // rate memory when demand rises: follows spikes fast
 	rateTauDown     = 2 * time.Second // rate memory when demand falls: less stock left to expire
 	metricsTTL      = 10 * time.Minute
 	breakerCut      = 0.25 // share of the ceiling left when the breaker trips
+
+	// The stock follows the demand only after requests arrived in each of the last sustainBins
+	// intervals of sustainBin (40s): one burst must not fill a stock that would expire unused.
+	sustainBin  = 5 * time.Second
+	sustainBins = 8
 )
 
 // brakeFields are the fields of the brake hash, in the order stockTick reads them.
@@ -33,7 +39,7 @@ const (
 	fLimit     = iota // stock limit, generations/s
 	fCover            // coverage factor, shrunk by waste
 	fLimited          // last window cut by the limit
-	fUsed             // orders reserved in window usedAt
+	fUsed             // generations planned in window usedAt
 	fUsedAt           //
 	fSatSince         // when saturation at the ceiling with failing generation began, ms
 	fCoolUntil        // the limit cannot grow until then, ms
@@ -42,46 +48,75 @@ const (
 	fWaste            // moving share of the generations that expired
 )
 
-// reserveScript counts what is being generated and reserves what is missing in one step, so two
-// tasks never reserve the same gap. Each order takes a free slot of its picked solver or is
-// skipped. A cut by the limit marks the window as saturated. Returns the solver index (1-based) of
-// each reserved order.
-// KEYS: inflight, brake, busy of each solver (same hash tag).
-// ARGV: mark expiry, now, missing, member prefix, mark TTL, limit, window, limit of each solver
-// (0 = no limit), then the picked solver index of each order.
+// reserveScript plans the stock generations of a window in one step, so two tasks never plan the
+// same gap: missing minus what is being generated, capped by the limit. Each planned generation
+// takes a free stock slot of its picked solver now; what does not fit is queued in orders, and each
+// stock generation that ends takes the next one. A cut by the limit marks the window as saturated.
+// Returns the solver index (1-based) of each generation started now.
+// KEYS: orders, brake, then busy and stock of each solver (same hash tag).
+// ARGV: mark expiry, now, missing, member prefix, mark TTL, limit, window, orders TTL, then limit
+// and stock cap of each solver (limit 0 = no limit), then the picked solver index of each order.
 var reserveScript = redis.NewScript(`
-local ns = #KEYS - 2
-redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', ARGV[2])
-local want = math.min(tonumber(ARGV[3]) - redis.call('ZCARD', KEYS[1]), #ARGV - 7 - ns)
+local ns = (#KEYS - 2) / 2
+local inflight, free = 0, {}
+for i = 1, ns do
+	local busy, stock = KEYS[1 + 2 * i], KEYS[2 + 2 * i]
+	redis.call('ZREMRANGEBYSCORE', busy, '-inf', ARGV[2])
+	redis.call('ZREMRANGEBYSCORE', stock, '-inf', ARGV[2])
+	local s = redis.call('ZCARD', stock)
+	inflight = inflight + s
+	local lim, cap = tonumber(ARGV[7 + 2 * i]), tonumber(ARGV[8 + 2 * i])
+	free[i] = lim > 0 and math.min(lim - redis.call('ZCARD', busy), cap - s) or math.huge
+end
+local want = tonumber(ARGV[3]) - inflight
 local n = math.max(0, math.min(want, tonumber(ARGV[6])))
 if n < want then redis.call('HSET', KEYS[2], 'limited', ARGV[7]) end
-local free, got = {}, {}
-for i = 1, ns do
-	redis.call('ZREMRANGEBYSCORE', KEYS[2 + i], '-inf', ARGV[2])
-	local lim = tonumber(ARGV[7 + i])
-	free[i] = lim > 0 and lim - redis.call('ZCARD', KEYS[2 + i]) or n
-end
-for p = 8 + ns, #ARGV do
+redis.call('HSET', KEYS[2], 'used', n, 'usedAt', ARGV[7])
+local got = {}
+for p = 9 + 2 * ns, #ARGV do
 	if #got == n then break end
 	local i = tonumber(ARGV[p])
 	if free[i] > 0 then
 		free[i] = free[i] - 1
 		local m = ARGV[4] .. (#got + 1)
-		redis.call('ZADD', KEYS[1], ARGV[1], m)
-		redis.call('ZADD', KEYS[2 + i], ARGV[1], m)
+		redis.call('ZADD', KEYS[1 + 2 * i], ARGV[1], m)
+		redis.call('ZADD', KEYS[2 + 2 * i], ARGV[1], m)
 		got[#got + 1] = i
 	end
 end
-redis.call('PEXPIRE', KEYS[1], ARGV[5])
-for i = 1, ns do redis.call('PEXPIRE', KEYS[2 + i], ARGV[5]) end
-redis.call('HSET', KEYS[2], 'used', #got, 'usedAt', ARGV[7])
+for k = 3, #KEYS do redis.call('PEXPIRE', KEYS[k], ARGV[5]) end
+redis.call('SET', KEYS[1], n - #got, 'PX', ARGV[8])
 return got
+`)
+
+// nextOrderScript ends a stock generation: it frees its slot and, if an order is queued and the
+// slot is still within the solver's limits, takes the order and keeps the slot under a new mark.
+// Returns 1 when it took one.
+// KEYS: orders, busy and stock of the solver (same hash tag).
+// ARGV: old mark, new mark, now, mark expiry, mark TTL, limit (0 = no limit), stock cap.
+var nextOrderScript = redis.NewScript(`
+redis.call('ZREM', KEYS[2], ARGV[1])
+redis.call('ZREM', KEYS[3], ARGV[1])
+local lim = tonumber(ARGV[6])
+if lim > 0 then
+	redis.call('ZREMRANGEBYSCORE', KEYS[2], '-inf', ARGV[3])
+	redis.call('ZREMRANGEBYSCORE', KEYS[3], '-inf', ARGV[3])
+	if redis.call('ZCARD', KEYS[2]) >= lim or redis.call('ZCARD', KEYS[3]) >= tonumber(ARGV[7]) then return 0 end
+end
+if tonumber(redis.call('GET', KEYS[1]) or '0') <= 0 then return 0 end
+redis.call('DECR', KEYS[1])
+redis.call('ZADD', KEYS[2], ARGV[4], ARGV[2])
+redis.call('ZADD', KEYS[3], ARGV[4], ARGV[2])
+redis.call('PEXPIRE', KEYS[2], ARGV[5])
+redis.call('PEXPIRE', KEYS[3], ARGV[5])
+return 1
 `)
 
 // solverState is the global state of one solver of a key, refreshed by every stock tick.
 type solverState struct {
-	busy int  // generations in progress, from every task
-	sick bool // failing or slow against its own baseline
+	busy  int  // generations in progress, from every task
+	stock int  // of those, stock generations
+	sick  bool // failing or slow against its own baseline
 }
 
 // solverStates returns the last known state of each solver of key, nil before the first tick.
@@ -90,6 +125,15 @@ func (b *BucketHandler) solverStates(key Key) []solverState {
 		return v.([]solverState)
 	}
 	return nil
+}
+
+// stockCap is how many generations of a solver the stock may hold: its limit minus the share kept
+// for solving now, at least one slot when share is set.
+func stockCap(limit int, share float64) int {
+	if limit <= 0 || share <= 0 {
+		return limit
+	}
+	return max(0, limit-max(1, int(math.Round(float64(limit)*share))))
 }
 
 // RunStock refills the stock of every key once per stockTick until ctx ends. Every task runs it.
@@ -113,33 +157,41 @@ func (b *BucketHandler) RunStock(ctx context.Context) {
 }
 
 // stockTick refreshes the solver states and, when this task leads the window (the first one to
-// claim it), generates what the stock of key misses:
+// claim it), plans the stock generations of the window:
 //
-//	target = ceil(rate × coverage)
-//	order  = target − pool − inflight, capped by the brake and the solver limits
+//	target = ceil(rate × coverage), or 0 until the demand is sustained
+//	plan   = target − pool − inflight, capped by the brake; started now on free stock slots,
+//	         the rest queued for the stock generations that end
 //
+// When the demand falls below what the stock can sell before it expires (rate × TTL < pool +
+// inflight), the stock stops and waits for sustained demand again.
 // Only the leader writes the rate and brake state, once per window, so it needs no script.
 func (b *BucketHandler) stockTick(ctx context.Context, key Key) error {
-	cfg, ok := b.config.Stock[key]
+	cfg, ok := b.cfg().Stock[key]
 	solvers := b.solvers[key]
-	if !ok || cfg.MaxPerSecond <= 0 || len(solvers) == 0 {
+	if !ok || cfg.MaxPerSecond <= 0 || len(solvers) == 0 || b.sm == nil {
 		return nil
 	}
 	now := time.Now()
 	nowMs := float64(now.UnixMilli())
+	nowArg := strconv.FormatInt(now.UnixMilli(), 10)
 	window := now.UnixMilli() / stockTick.Milliseconds()
 	rateKey, brakeKey, genKey := redisKey(key, "rate"), redisKey(key, "brake"), redisKey(key, "gen")
+	snapsKey := redisKey(key, "snaps")
 
 	// One round trip for every task: the window lead, the solver states and what the leader needs.
 	pipe := b.redis.Pipeline()
 	lead := pipe.SetNX(ctx, redisKey(key, "leader:"+strconv.FormatInt(window, 10)), 1, 2*stockTick)
 	busy := make([]*redis.IntCmd, len(solvers))
+	stock := make([]*redis.IntCmd, len(solvers))
 	health := make([]*redis.SliceCmd, len(solvers))
 	for i, s := range solvers {
-		busy[i] = pipe.ZCount(ctx, busyKey(key, s.GetName()), strconv.FormatInt(now.UnixMilli(), 10), "+inf")
+		busy[i] = pipe.ZCount(ctx, busyKey(key, s.GetName()), nowArg, "+inf")
+		stock[i] = pipe.ZCount(ctx, stockKey(key, s.GetName()), nowArg, "+inf")
 		health[i] = pipe.HMGet(ctx, solverGenKey(key, s.GetName()), "mean", "base", "fail")
 	}
-	rateCmd := pipe.HMGet(ctx, rateKey, "rate", "total", "at")
+	rateCmd := pipe.HMGet(ctx, rateKey, "rate", "total", "at", "bin")
+	snapsCmd := pipe.LRange(ctx, snapsKey, 0, sustainBins)
 	totalCmd := pipe.Get(ctx, redisKey(key, "requests"))
 	brakeCmd := pipe.HMGet(ctx, brakeKey, brakeFields...)
 	genCmd := pipe.HMGet(ctx, genKey, "mean", "var", "fail", "made")
@@ -148,9 +200,11 @@ func (b *BucketHandler) stockTick(ctx context.Context, key Key) error {
 	}
 
 	states := make([]solverState, len(solvers))
+	inflight := 0
 	for i := range states {
 		h := hvals(health[i])
-		states[i] = solverState{busy: int(busy[i].Val()), sick: sick(cfg, h[0], h[1], h[2])}
+		states[i] = solverState{busy: int(busy[i].Val()), stock: int(stock[i].Val()), sick: sick(cfg, h[0], h[1], h[2])}
+		inflight += states[i].stock
 	}
 	b.states.Store(key, states)
 	if !lead.Val() {
@@ -160,6 +214,25 @@ func (b *BucketHandler) stockTick(ctx context.Context, key Key) error {
 	r, k, g := hvals(rateCmd), hvals(brakeCmd), hvals(genCmd)
 	total, _ := totalCmd.Float64()
 	rate, saveRate := nextRate(orElse(r[0], 0), r[1], r[2], total, nowMs)
+
+	// Request counter snapshots at the start of each sustainBin interval, newest first. A skipped
+	// interval restarts them, since its requests are unknown.
+	bin := now.Unix() / int64(sustainBin/time.Second)
+	var snaps []float64
+	for _, s := range snapsCmd.Val() {
+		if f, err := strconv.ParseFloat(s, 64); err == nil {
+			snaps = append(snaps, f)
+		}
+	}
+	newBin := r[3] != float64(bin)
+	restart := newBin && r[3] != float64(bin-1)
+	if restart {
+		snaps = nil
+	}
+	if newBin {
+		snaps = append([]float64{total}, snaps...)[:min(len(snaps)+1, sustainBins+1)]
+	}
+
 	limit, satSince, coolUntil, tripped := nextLimit(cfg, k, rate, orElse(g[2], 0), nowMs, window)
 	if tripped {
 		log.Warn("disjuntor do estoque aberto", "key", key.String(), "limite", limit)
@@ -176,40 +249,56 @@ func (b *BucketHandler) stockTick(ctx context.Context, key Key) error {
 	made := orElse(g[3], 0)
 	cover, waste := nextCover(cfg, k, made, float64(expired))
 	coverage := b.coverage(key, orElse(g[0], -1), orElse(g[1], 0), cover)
-	target := int(math.Ceil(rate * coverage.Seconds()))
+
+	sus := sustained(snaps)
+	if ttl, ok := b.cfg().TTLs[key]; ok && sus && rate*ttl.Seconds() < float64(pool+inflight) {
+		log.Warn("demanda abaixo do que o estoque vende antes de vencer, estoque suspenso", "key", key.String(),
+			"rate", rate, "pool", pool, "inflight", inflight)
+		snaps, restart, sus = []float64{total}, true, false
+	}
+	target := 0
+	if sus {
+		target = int(math.Ceil(rate * coverage.Seconds()))
+	}
 	log.Debug("refill do estoque", "key", key.String(), "rate", rate, "coverage", coverage,
-		"target", target, "pool", pool, "limit", limit)
-	missing := target - pool
+		"target", target, "pool", pool, "inflight", inflight, "limit", limit, "sustained", sus)
 
 	pipe = b.redis.Pipeline()
 	if saveRate {
 		pipe.HSet(ctx, rateKey, "rate", rate, "total", total, "at", nowMs)
 		pipe.PExpire(ctx, rateKey, metricsTTL)
 	}
+	if newBin || restart {
+		if restart {
+			pipe.Del(ctx, snapsKey)
+		}
+		pipe.LPush(ctx, snapsKey, total)
+		pipe.LTrim(ctx, snapsKey, 0, sustainBins)
+		pipe.PExpire(ctx, snapsKey, metricsTTL)
+		pipe.HSet(ctx, rateKey, "bin", bin)
+		pipe.PExpire(ctx, rateKey, metricsTTL)
+	}
 	pipe.HSet(ctx, brakeKey, "limit", limit, "cover", cover, "satSince", satSince, "coolUntil", coolUntil,
 		"made", made, "expired", expired, "waste", waste)
 	pipe.PExpire(ctx, brakeKey, metricsTTL)
+
+	// Always runs: with nothing missing it empties the queued orders.
+	missing := target - pool
 	prefix := b.id + ":" + strconv.FormatInt(b.seq.Add(1), 10) + ":"
-	var reserve *redis.Cmd
-	if picks := b.pickStock(key, solvers, states, missing); len(picks) > 0 {
-		redisKeys := []string{redisKey(key, "inflight"), brakeKey}
-		args := []any{now.Add(genLife).UnixMilli(), now.UnixMilli(), missing, prefix, (2 * genLife).Milliseconds(),
-			int(math.Ceil(limit * stockTick.Seconds())), window}
-		for _, s := range solvers {
-			redisKeys = append(redisKeys, busyKey(key, s.GetName()))
-			args = append(args, s.GetLimit())
-		}
-		for _, i := range picks {
-			args = append(args, i+1)
-		}
-		// Eval, not Run: a pipeline cannot fall back from EVALSHA on NOSCRIPT.
-		reserve = reserveScript.Eval(ctx, pipe, redisKeys, args...)
+	redisKeys := []string{redisKey(key, "orders"), brakeKey}
+	args := []any{now.Add(genLife).UnixMilli(), now.UnixMilli(), missing, prefix, (2 * genLife).Milliseconds(),
+		int(math.Ceil(limit * stockTick.Seconds())), window, ordersTTL.Milliseconds()}
+	for _, s := range solvers {
+		redisKeys = append(redisKeys, busyKey(key, s.GetName()), stockKey(key, s.GetName()))
+		args = append(args, s.GetLimit(), stockCap(s.GetLimit(), cfg.DirectShare))
 	}
+	for _, i := range b.pickStock(key, solvers, states, missing-inflight, cfg.DirectShare) {
+		args = append(args, i+1)
+	}
+	// Eval, not Run: a pipeline cannot fall back from EVALSHA on NOSCRIPT.
+	reserve := reserveScript.Eval(ctx, pipe, redisKeys, args...)
 	if _, err := pipe.Exec(ctx); err != nil {
 		return fmt.Errorf("falha ao reservar a geração: %w", err)
-	}
-	if reserve == nil {
-		return nil
 	}
 	got, err := reserve.Int64Slice()
 	if err != nil {
@@ -242,6 +331,20 @@ func orElse(v, def float64) float64 {
 		return def
 	}
 	return v
+}
+
+// sustained tells whether requests arrived in each of the last sustainBins intervals, from the
+// request counter snapshots taken at the start of each one (newest first).
+func sustained(snaps []float64) bool {
+	if len(snaps) <= sustainBins {
+		return false
+	}
+	for i := range sustainBins {
+		if snaps[i] <= snaps[i+1] {
+			return false
+		}
+	}
+	return true
 }
 
 // sick tells whether a solver fails too often or is slow against its own baseline, per cfg.
@@ -318,15 +421,15 @@ func nextCover(cfg external.StockConfig, k []float64, made, expired float64) (co
 	return min(1, cover*1.05), waste
 }
 
-// pickStock picks the solver (index) of up to n stock orders, by preference among the solvers
-// with room: healthy ones first, a sick one only when no healthy one has room. Each sick solver
-// with room also gets one probe order, so it is measured again.
-func (b *BucketHandler) pickStock(key Key, solvers []SolverInterface[any], states []solverState, n int) []int {
+// pickStock picks the solver (index) of up to n stock generations, by preference among the
+// solvers with a free stock slot: healthy ones first, a sick one only when no healthy one has
+// room. Each sick solver with room also gets one probe, so it is measured again.
+func (b *BucketHandler) pickStock(key Key, solvers []SolverInterface[any], states []solverState, n int, share float64) []int {
 	free := make([]int, len(solvers))
 	for i, s := range solvers {
 		free[i] = n
 		if l := s.GetLimit(); l > 0 {
-			free[i] = l - states[i].busy
+			free[i] = min(l-states[i].busy, stockCap(l, share)-states[i].stock)
 		}
 	}
 	var picks []int
@@ -368,30 +471,58 @@ func (b *BucketHandler) coverage(key Key, mean, variance, factor float64) time.D
 		cover = time.Duration(ms*float64(time.Millisecond)) + stockTick
 	}
 	cover = time.Duration(float64(cover) * factor)
-	if ttl, ok := b.config.TTLs[key]; ok {
+	if ttl, ok := b.cfg().TTLs[key]; ok {
 		cover = min(cover, ttl)
 	}
 	return cover
 }
 
-// generate solves one product for the stock with solver and saves it. The marks leave only after
-// the save, so meanwhile it counts twice: it errs on generating less, not more.
+// generate runs stock generations with solver on one slot: after each one, it takes the next
+// queued order on the same slot right away, without waiting for the next tick. It stops when no
+// order is queued, on a failure, or when the solver turns sick; then the slot is freed.
 func (b *BucketHandler) generate(key Key, solver SolverInterface[any], member string) {
 	ctx := context.Background()
-	defer b.redis.Pipelined(ctx, func(p redis.Pipeliner) error {
-		p.ZRem(ctx, redisKey(key, "inflight"), member)
-		p.ZRem(ctx, busyKey(key, solver.GetName()), member)
-		return nil
-	})
+	name := solver.GetName()
+	defer func() {
+		b.redis.Pipelined(ctx, func(p redis.Pipeliner) error {
+			p.ZRem(ctx, busyKey(key, name), member)
+			p.ZRem(ctx, stockKey(key, name), member)
+			return nil
+		})
+	}()
+	for b.stockOne(ctx, key, solver) && !b.isSick(key, solver) {
+		next := b.id + ":" + strconv.FormatInt(b.seq.Add(1), 10) + ":c"
+		now := time.Now()
+		took, err := nextOrderScript.Run(ctx, b.redis,
+			[]string{redisKey(key, "orders"), busyKey(key, name), stockKey(key, name)},
+			member, next, now.UnixMilli(), now.Add(genLife).UnixMilli(), (2 * genLife).Milliseconds(),
+			solver.GetLimit(), stockCap(solver.GetLimit(), b.cfg().Stock[key].DirectShare),
+		).Int()
+		if err != nil || took == 0 {
+			return
+		}
+		member = next
+	}
+}
 
+// stockOne solves one product for the stock with solver and saves it. It reports success.
+func (b *BucketHandler) stockOne(ctx context.Context, key Key, solver SolverInterface[any]) bool {
 	prod, err := b.solve(key, solver, nil)
 	if err != nil {
 		log.Warn("falha ao gerar produto para o estoque", "key", key.String(), "err", err)
-		return
+		return false
 	}
 	if _, err := b.sm.Save(ctx, key, prod); err != nil {
 		log.Warn("falha ao salvar produto no estoque", "key", key.String(), "err", err)
-		return
+		return false
 	}
 	b.redis.HIncrBy(ctx, redisKey(key, "gen"), "made", 1)
+	return true
+}
+
+// isSick tells whether solver was sick at the last stock tick.
+func (b *BucketHandler) isSick(key Key, solver SolverInterface[any]) bool {
+	states := b.solverStates(key)
+	i := slices.Index(b.solvers[key], solver)
+	return i >= 0 && i < len(states) && states[i].sick
 }

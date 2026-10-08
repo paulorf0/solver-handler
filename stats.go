@@ -105,6 +105,9 @@ func redisKey(key Key, name string) string { return "{" + key.String() + "}:" + 
 // busyKey holds the generations in progress of one solver of Key, from every task.
 func busyKey(key Key, solver string) string { return redisKey(key, "busy:"+solver) }
 
+// stockKey holds the stock generations in progress of one solver of Key, from every task.
+func stockKey(key Key, solver string) string { return redisKey(key, "stock:"+solver) }
+
 // solverGenKey holds the generation metrics of one solver of Key, from every task.
 func solverGenKey(key Key, solver string) string { return redisKey(key, "gen:"+solver) }
 
@@ -163,7 +166,7 @@ func (b *BucketHandler) recordGeneration(key Key, solver string, elapsed time.Du
 		ms = -1
 	}
 	recordGenScript.Run(context.Background(), b.redis, []string{redisKey(key, "gen"), solverGenKey(key, solver)},
-		ms, genWeight, baseWeight, metricsTTL.Milliseconds(), b.config.Stock[key].LatencyFactor)
+		ms, genWeight, baseWeight, metricsTTL.Milliseconds(), b.cfg().Stock[key].LatencyFactor)
 }
 
 // pickNowScript marks busy the first solver of the preference order with room, or the first one

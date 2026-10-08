@@ -74,6 +74,7 @@ type StockConfig struct {
 	SaturatedFor  int64   `json:"saturatedFor"`  // seconds at the ceiling that trip the breaker
 	Cooldown      int64   `json:"cooldown"`      // seconds the limit cannot grow after a trip
 	MaxWaste      float64 `json:"maxWaste"`      // wasted share of the generations that shrinks the coverage
+	DirectShare   float64 `json:"directShare"`   // share of each solver's limit kept for solving now (at least 1 slot)
 }
 
 // Stocks maps each Key to its StockConfig. It comes from {"name|client": {...}}.

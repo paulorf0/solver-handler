@@ -19,8 +19,8 @@ type BucketHandler struct {
 	solvers map[Key][]SolverInterface[any]
 	stats   map[Key]*KeyStats
 
-	config external.Config
-	sm     external.SessionManager[Product[any]] // external stock of products
+	config atomic.Pointer[external.Config]        // current config, replaced whole on each load
+	sm     *external.SessionManager[Product[any]] // external stock of products, nil means no stock
 
 	redis *redis.Client
 	id    string       // identifies this task in the inflight marks
@@ -54,9 +54,10 @@ func (b *BucketHandler) GetProduct(req Request) (Product[any], error) {
 	b.countRequest(key)
 
 	// Any failure of the external stock falls back to solving now.
-	product, err := b.sm.Get(context.Background(), key)
-	if err == nil {
-		return product, nil
+	if b.sm != nil {
+		if product, err := b.sm.Get(context.Background(), key); err == nil {
+			return product, nil
+		}
 	}
 
 	order, err := b.TryGetSolver(key)
@@ -98,7 +99,7 @@ func (b *BucketHandler) TryGetSolver(key Key) ([]SolverInterface[any], error) {
 	if len(solvers) == 0 {
 		return nil, fmt.Errorf("nenhum Solver registrado com a chave fornecida")
 	}
-	if b.config.AdaptiveChoice {
+	if b.cfg().AdaptiveChoice {
 		return PickSolver(solvers, b.solverStates(key)), nil
 	}
 	return DrawSolver(solvers), nil
