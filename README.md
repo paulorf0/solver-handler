@@ -90,5 +90,8 @@ go test -race ./...
 - Os campos de `Product` não são exportados, então ele ainda não pode ser lido do JSON do estoque externo.
 - Qualquer falha do estoque externo cai em "resolver na hora"; ainda não se distingue "sem estoque" de "sistema fora".
 - As rotas são fixas após criar o `SessionManager`; trocar em produção precisa de substituição atômica.
-- As métricas da escolha adaptativa ainda são por task, não globais.
+- As métricas da escolha adaptativa (`SolverStats`) ainda são por task, não globais. Próxima etapa depois do estoque distribuído: levar para o Redis em `{name|client}:solver:<nome>`.
+- Limite de concorrência por solver: nada chama `SetLimit` ainda. Falta aplicar `Config.SolverLimit` do backoffice em cada solver ao carregar a config; até lá, todos ficam sem teto (limite 0).
+- **A pensar:** distribuir a geração do estoque entre os pods. Hoje o primeiro pod a ticar em cada segundo reserva toda a falta e gera tudo sozinho.
+- **A pensar:** `redisconn` usa `redis.Client` (nó único). Com ElastiCache em modo cluster, trocar por `redis.UniversalClient`/`ClusterClient`, que segue `MOVED`/`ASK`.
 - **Estoque x dados do cliente (considerar no refill):** quando o solve depende do que o cliente envia em `Params` (por exemplo, a proxy), um produto gerado antes, para o estoque, não usou esses dados. Saídas possíveis: essas chaves não usam estoque e sempre resolvem na hora, ou a proxy (ou o pool dela) entra na chave, separando o estoque por proxy.

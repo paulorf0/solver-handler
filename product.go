@@ -14,7 +14,6 @@ type Product[T any] struct {
 	Elapsed int64
 
 	Token T
-	TTL   TTL
 }
 
 func GetHash(key Key) string {

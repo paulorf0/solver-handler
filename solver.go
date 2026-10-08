@@ -8,6 +8,8 @@ type SolverInterface[T any] interface {
 	GetWeight() int
 	GetStatistic() *SolverStats
 	GetInflights() int
+	GetLimit() int // concurrent limit, 0 means no limit
+	SetLimit(limit int)
 
 	AddInflights()
 	SubInflights()
@@ -21,6 +23,7 @@ type BaseSolver struct {
 	key       Key
 	weight    uint8        // In percent, 0 - 100 %
 	inflights atomic.Int32 // Quantity of product currently being generated.
+	limit     atomic.Int32 // Concurrent limit, from the config. 0 means no limit.
 
 	stats SolverStats
 }
@@ -35,10 +38,16 @@ func (b *BaseSolver) GetWeight() int             { return int(b.weight) }
 func (b *BaseSolver) GetStatistic() *SolverStats { return &b.stats }
 func (b *BaseSolver) GetInflights() int          { return int(b.inflights.Load()) }
 
+func (b *BaseSolver) GetLimit() int          { return int(b.limit.Load()) }
+func (b *BaseSolver) SetLimit(limit int)     { b.limit.Store(int32(limit)) }
+
 func (b *BaseSolver) AddInflights() { b.inflights.Add(+1) }
 func (b *BaseSolver) SubInflights() {
-	if b.inflights.Load() > 0 {
-		b.inflights.Add(-1)
+	for {
+		n := b.inflights.Load()
+		if n <= 0 || b.inflights.CompareAndSwap(n, n-1) {
+			return
+		}
 	}
 }
 

@@ -32,6 +32,8 @@ func (f *fakeSolver) GetStatistic() *SolverStats { return &f.stats }
 func (f *fakeSolver) GetInflights() int { return 0 }
 func (f *fakeSolver) AddInflights()     {}
 func (f *fakeSolver) SubInflights()     {}
+func (f *fakeSolver) GetLimit() int     { return 0 }
+func (f *fakeSolver) SetLimit(int)      {}
 
 func (f *fakeSolver) Solve(Params) (any, error) {
 	f.calls++
@@ -96,7 +98,7 @@ func TestTryGetSolver(t *testing.T) {
 	b := newBuckets(keyA, solver)
 
 	got, err := b.TryGetSolver(keyA)
-	if err != nil || got != SolverInterface[any](solver) {
+	if err != nil || len(got) != 1 || got[0] != SolverInterface[any](solver) {
 		t.Errorf("got = %v, err = %v; quer %v, nil", got, err, solver)
 	}
 	if _, err := b.TryGetSolver(keyOutra); err == nil {
@@ -163,12 +165,12 @@ func TestChaveParaSolver(t *testing.T) {
 func TestSolverRegistradoTemASuaChave(t *testing.T) {
 	b := newBuckets(keyAlfa, &fakeSolver{key: keyAlfa})
 
-	solver, err := b.TryGetSolver(keyAlfa)
+	order, err := b.TryGetSolver(keyAlfa)
 	if err != nil {
 		t.Fatalf("erro inesperado: %v", err)
 	}
-	if solver.GetKey() != keyAlfa {
-		t.Errorf("GetKey() = %q, quer %q", solver.GetKey(), keyAlfa)
+	if order[0].GetKey() != keyAlfa {
+		t.Errorf("GetKey() = %q, quer %q", order[0].GetKey(), keyAlfa)
 	}
 }
 

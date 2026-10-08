@@ -28,18 +28,36 @@ func (r *Routes) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
+// PoolStats reports the state of the pool of key. Each user implements it
+// for their own session manager.
+type PoolStats interface {
+	Len(ctx context.Context, key keys.Key) (int, error)     // items in the pool
+	Expired(ctx context.Context, key keys.Key) (int, error) // items that expired while stored
+}
+
 // SessionManager is a External that saves and reads values on the path that Routes gives for each key.
 type SessionManager[T any] struct {
 	*External[T]
 	routes Routes
+	pool   PoolStats
 }
 
-func NewSessionManager[T any](rawURL string, token *string, routes Routes) (*SessionManager[T], error) {
+func NewSessionManager[T any](rawURL string, token *string, routes Routes, pool PoolStats) (*SessionManager[T], error) {
 	b, err := New[T](rawURL, token)
 	if err != nil {
 		return nil, err
 	}
-	return &SessionManager[T]{External: b, routes: routes}, nil
+	return &SessionManager[T]{External: b, routes: routes, pool: pool}, nil
+}
+
+// Len returns the pool size of key, as the PoolStats given on creation says.
+func (s *SessionManager[T]) Len(ctx context.Context, key keys.Key) (int, error) {
+	return s.pool.Len(ctx, key)
+}
+
+// Expired returns how many stored items of key expired, as the PoolStats given on creation says.
+func (s *SessionManager[T]) Expired(ctx context.Context, key keys.Key) (int, error) {
+	return s.pool.Expired(ctx, key)
 }
 
 // Save posts value as JSON to the path of key.

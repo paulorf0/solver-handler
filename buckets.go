@@ -5,9 +5,11 @@ import (
 	crand "crypto/rand"
 	"fmt"
 	log "log/slog"
-	"math/rand/v2"
+	"slices"
 	"solver-handler/external"
 	"solver-handler/redisconn"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -21,7 +23,10 @@ type BucketHandler struct {
 	sm     external.SessionManager[Product[any]] // external stock of products
 
 	redis *redis.Client
-	id    string // identifies this task in the Signal lock
+	id    string       // identifies this task in the inflight marks
+	seq   atomic.Int64 // numbers the stock reservations of this task
+
+	states sync.Map // Key -> []solverState, refreshed by every stock tick
 }
 
 func NewBucketHandler() *BucketHandler {
@@ -54,13 +59,21 @@ func (b *BucketHandler) GetProduct(req Request) (Product[any], error) {
 		return product, nil
 	}
 
-	solver, err := b.TryGetSolver(key)
+	order, err := b.TryGetSolver(key)
 	if err != nil {
 		return Product[any]{}, err
 	}
+	solver, member := b.startNow(key, order)
+	defer b.finishNow(key, solver.GetName(), member)
+	return b.solve(key, solver, req.Params)
+}
 
+// solve generates a product of key now with solver and records the generation in the global metrics.
+func (b *BucketHandler) solve(key Key, solver SolverInterface[any], params Params) (Product[any], error) {
 	solver.AddInflights()
-	prod, err := NewProductBySolve(key, solver, req.Params)
+	start := time.Now()
+	prod, err := NewProductBySolve(key, solver, params)
+	b.recordGeneration(key, solver.GetName(), time.Since(start), err)
 	solver.SubInflights()
 
 	return prod, err
@@ -78,38 +91,32 @@ func (b *BucketHandler) ReportUsage(key Key, solver string, success bool) error 
 	return fmt.Errorf("nenhum Solver %q registrado com a chave fornecida", solver)
 }
 
-// TryGetSolver picks one of the Key's solvers: adaptive score or fixed weight, per config.
-func (b *BucketHandler) TryGetSolver(key Key) (SolverInterface[any], error) {
-	solve, ok := b.solvers[key]
-	if !ok || len(solve) == 0 {
+// TryGetSolver orders the Key's solvers by preference, adaptive score or fixed weight, per config.
+// Callers take the first one with room.
+func (b *BucketHandler) TryGetSolver(key Key) ([]SolverInterface[any], error) {
+	solvers := b.solvers[key]
+	if len(solvers) == 0 {
 		return nil, fmt.Errorf("nenhum Solver registrado com a chave fornecida")
 	}
 	if b.config.AdaptiveChoice {
-		return PickSolver(solve), nil
+		return PickSolver(solvers, b.solverStates(key)), nil
 	}
-	return DrawSolver(solve), nil
+	return DrawSolver(solvers), nil
 }
 
-// DrawSolver sorteia um Solver com probabilidade proporcional ao seu peso.
-func DrawSolver(solvers []SolverInterface[any]) SolverInterface[any] {
-	if len(solvers) == 0 {
-		return nil
-	}
-
-	total := 0
+// DrawSolver orders the solvers by draws without replacement, proportional to their weight.
+// Solvers with weight 0 are disabled, unless all are.
+func DrawSolver(solvers []SolverInterface[any]) []SolverInterface[any] {
+	var pool []SolverInterface[any]
+	var weights []float64
 	for _, s := range solvers {
-		total += s.GetWeight()
-	}
-	if total == 0 {
-		return solvers[0]
-	}
-
-	n := rand.IntN(total)
-	for _, s := range solvers {
-		n -= s.GetWeight()
-		if n < 0 {
-			return s
+		if s.GetWeight() > 0 {
+			pool = append(pool, s)
+			weights = append(weights, float64(s.GetWeight()))
 		}
 	}
-	return solvers[len(solvers)-1]
+	if len(pool) == 0 {
+		return slices.Clone(solvers)
+	}
+	return drawOrder(pool, weights)
 }

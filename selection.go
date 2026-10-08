@@ -3,33 +3,39 @@ package main
 import (
 	"math"
 	"math/rand/v2"
+	"slices"
 	"time"
 )
 
-// TODO: Essas métricas precisam vir de um sistema externo. Um Solver pode ter um teto de geração concorrente que consegue fazer.
+// TODO: Essas métricas precisam vir de um sistema externo.
 const (
 	priorSamples   = 2.0  // fake successes and failures added to every rate
 	minShare       = 0.05 // minimum traffic share, so a bad Solver keeps being tested
 	maxShare       = 0.90 // maximum traffic share, so no Solver takes everything
 	minSpeed       = 0.5
 	maxSpeed       = 2.0
-	solverCapacity = 10.0 // inflights At which the load factor halves
+	solverCapacity = 10.0 // busy count at which the load factor halves, for a Solver without limit
 	neutralScore   = 0.25 // score with no samples: 0.5 × 0.5
 )
 
-// PickSolver draws a Solver by its adaptive score. Solvers with weight 0 are disabled.
-func PickSolver(solvers []SolverInterface[any]) SolverInterface[any] {
-	pool := make([]SolverInterface[any], 0, len(solvers))
-	for _, s := range solvers {
+// PickSolver orders the solvers by draws without replacement, proportional to their adaptive score.
+// Solvers with weight 0 are disabled, unless all are. states, when known, is the global state of
+// each solver, aligned with solvers.
+func PickSolver(solvers []SolverInterface[any], states []solverState) []SolverInterface[any] {
+	var pool []SolverInterface[any]
+	var busy []int
+	for i, s := range solvers {
 		if s.GetWeight() > 0 {
 			pool = append(pool, s)
+			n := s.GetInflights()
+			if i < len(states) {
+				n = states[i].busy
+			}
+			busy = append(busy, n)
 		}
 	}
 	if len(pool) == 0 {
-		if len(solvers) == 0 {
-			return nil
-		}
-		return solvers[0]
+		return slices.Clone(solvers)
 	}
 
 	now := time.Now()
@@ -47,26 +53,46 @@ func PickSolver(solvers []SolverInterface[any]) SolverInterface[any] {
 
 	scores := make([]float64, len(pool))
 	for i, s := range pool {
-		scores[i] = solverScore(counters[i], poolLatency, s.GetInflights()) * float64(s.GetWeight())
+		scores[i] = solverScore(counters[i], poolLatency, usage(s, busy[i])) * float64(s.GetWeight())
 	}
-
-	shares := boundedShares(scores, minShare, maxShare)
-	total := 0.0
-	for _, w := range shares {
-		total += w
-	}
-	n := rand.Float64() * total
-	for i, w := range shares {
-		n -= w
-		if n < 0 {
-			return pool[i]
-		}
-	}
-	return pool[len(pool)-1]
+	return drawOrder(pool, boundedShares(scores, minShare, maxShare))
 }
 
-// solverScore is usage quality × generation availability × speed × load.
-func solverScore(c solverCounters, poolLatency float64, inflights int) float64 {
+// usage is the share of the solver's capacity in use: busy over its limit, or over solverCapacity
+// when it has none.
+func usage(s SolverInterface[any], busy int) float64 {
+	capacity := float64(s.GetLimit())
+	if capacity <= 0 {
+		capacity = solverCapacity
+	}
+	return float64(busy) / capacity
+}
+
+// drawOrder orders solvers by successive draws without replacement, each proportional to its weight.
+func drawOrder(solvers []SolverInterface[any], weights []float64) []SolverInterface[any] {
+	left, w := slices.Clone(solvers), slices.Clone(weights)
+	out := make([]SolverInterface[any], 0, len(left))
+	for len(left) > 0 {
+		total := 0.0
+		for _, x := range w {
+			total += x
+		}
+		i, n := len(left)-1, rand.Float64()*total
+		for j, x := range w {
+			if n -= x; n < 0 {
+				i = j
+				break
+			}
+		}
+		out = append(out, left[i])
+		left, w = slices.Delete(left, i, i+1), slices.Delete(w, i, i+1)
+	}
+	return out
+}
+
+// solverScore is usage quality × generation availability² × speed × load. The availability
+// counts twice, so a fast Solver that fails often does not outscore a healthy slower one.
+func solverScore(c solverCounters, poolLatency float64, used float64) float64 {
 	quality := (c.usageSuccess + priorSamples) / (c.usageSuccess + c.usageFailure + 2*priorSamples)
 	availability := (c.genSuccess + priorSamples) / (c.genSuccess + c.genFailure + 2*priorSamples)
 
@@ -76,9 +102,9 @@ func solverScore(c solverCounters, poolLatency float64, inflights int) float64 {
 		latency := (c.genElapsed + priorSamples*poolLatency) / (c.genSuccess + priorSamples)
 		speed = min(max(poolLatency/latency, minSpeed), maxSpeed)
 	}
-	load := 1 / (1 + float64(inflights)/solverCapacity)
+	load := 1 / (1 + used)
 
-	score := quality * availability * speed * load
+	score := quality * availability * availability * speed * load
 	if math.IsNaN(score) || math.IsInf(score, 0) || score <= 0 {
 		return neutralScore
 	}
