@@ -1,13 +1,14 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"time"
 )
 
 type Product[T any] struct {
 	Id     string
-	Key    Key
+	Key    string
 	Solver string // name of the Solver that generated it, used by ReportUsage
 
 	At      time.Time
@@ -16,16 +17,18 @@ type Product[T any] struct {
 	Token T
 }
 
-func GetHash(key Key) string {
+func GetHash(key string) string {
 	fixedHash := fmt.Sprintf("%s|%s", Version, key) // This initial hash never change.
 	return fixedHash
 }
 
-func NewProductBySolve[T any](key Key, solver SolverInterface[T], params Params) (Product[any], error) {
+func NewProductBySolve[T any](key string, solver SolverInterface[T], params Params) (Product[any], error) {
 	now := time.Now()
 	token, err := solver.Solve(params)
 	elapsed := time.Since(now)
-	solver.GetStatistic().AddGeneration(time.Now(), elapsed, err)
+	if !errors.Is(err, ErrProxy) { // a bad proxy says nothing about the solver
+		solver.GetStatistic().AddGeneration(time.Now(), elapsed, err)
+	}
 	if err != nil {
 		return Product[any]{}, err
 	}

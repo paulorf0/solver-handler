@@ -120,7 +120,7 @@ type solverState struct {
 }
 
 // solverStates returns the last known state of each solver of key, nil before the first tick.
-func (b *BucketHandler) solverStates(key Key) []solverState {
+func (b *BucketHandler) solverStates(key string) []solverState {
 	if v, ok := b.states.Load(key); ok {
 		return v.([]solverState)
 	}
@@ -149,7 +149,7 @@ func (b *BucketHandler) RunStock(ctx context.Context) {
 		tickCtx, cancel := context.WithTimeout(ctx, stockTick)
 		for key := range b.stats {
 			if err := b.stockTick(tickCtx, key); err != nil {
-				log.Warn("falha no refill do estoque", "key", key.String(), "err", err)
+				log.Warn("falha no refill do estoque", "key", key, "err", err)
 			}
 		}
 		cancel()
@@ -166,7 +166,7 @@ func (b *BucketHandler) RunStock(ctx context.Context) {
 // When the demand falls below what the stock can sell before it expires (rate × TTL < pool +
 // inflight), the stock stops and waits for sustained demand again.
 // Only the leader writes the rate and brake state, once per window, so it needs no script.
-func (b *BucketHandler) stockTick(ctx context.Context, key Key) error {
+func (b *BucketHandler) stockTick(ctx context.Context, key string) error {
 	cfg, ok := b.cfg().Stock[key]
 	solvers := b.solvers[key]
 	if !ok || cfg.MaxPerSecond <= 0 || len(solvers) == 0 || b.sm == nil {
@@ -235,7 +235,7 @@ func (b *BucketHandler) stockTick(ctx context.Context, key Key) error {
 
 	limit, satSince, coolUntil, tripped := nextLimit(cfg, k, rate, orElse(g[2], 0), nowMs, window)
 	if tripped {
-		log.Warn("disjuntor do estoque aberto", "key", key.String(), "limite", limit)
+		log.Warn("disjuntor do estoque aberto", "key", key, "limite", limit)
 	}
 
 	pool, err := b.sm.Len(ctx, key)
@@ -252,7 +252,7 @@ func (b *BucketHandler) stockTick(ctx context.Context, key Key) error {
 
 	sus := sustained(snaps)
 	if ttl, ok := b.cfg().TTLs[key]; ok && sus && rate*ttl.Seconds() < float64(pool+inflight) {
-		log.Warn("demanda abaixo do que o estoque vende antes de vencer, estoque suspenso", "key", key.String(),
+		log.Warn("demanda abaixo do que o estoque vende antes de vencer, estoque suspenso", "key", key,
 			"rate", rate, "pool", pool, "inflight", inflight)
 		snaps, restart, sus = []float64{total}, true, false
 	}
@@ -260,7 +260,7 @@ func (b *BucketHandler) stockTick(ctx context.Context, key Key) error {
 	if sus {
 		target = int(math.Ceil(rate * coverage.Seconds()))
 	}
-	log.Debug("refill do estoque", "key", key.String(), "rate", rate, "coverage", coverage,
+	log.Debug("refill do estoque", "key", key, "rate", rate, "coverage", coverage,
 		"target", target, "pool", pool, "inflight", inflight, "limit", limit, "sustained", sus)
 
 	pipe = b.redis.Pipeline()
@@ -424,7 +424,7 @@ func nextCover(cfg external.StockConfig, k []float64, made, expired float64) (co
 // pickStock picks the solver (index) of up to n stock generations, by preference among the
 // solvers with a free stock slot: healthy ones first, a sick one only when no healthy one has
 // room. Each sick solver with room also gets one probe, so it is measured again.
-func (b *BucketHandler) pickStock(key Key, solvers []SolverInterface[any], states []solverState, n int, share float64) []int {
+func (b *BucketHandler) pickStock(key string, solvers []SolverInterface[any], states []solverState, n int, share float64) []int {
 	free := make([]int, len(solvers))
 	for i, s := range solvers {
 		free[i] = n
@@ -464,7 +464,7 @@ func (b *BucketHandler) pickStock(key Key, solvers []SolverInterface[any], state
 
 // coverage is mean + 2σ of the generation time plus the tick (defaultCoverage while unmeasured),
 // times the waste factor, capped at the product TTL.
-func (b *BucketHandler) coverage(key Key, mean, variance, factor float64) time.Duration {
+func (b *BucketHandler) coverage(key string, mean, variance, factor float64) time.Duration {
 	cover := defaultCoverage
 	if mean >= 0 {
 		ms := mean + latencySigmas*math.Sqrt(max(variance, 0))
@@ -480,7 +480,7 @@ func (b *BucketHandler) coverage(key Key, mean, variance, factor float64) time.D
 // generate runs stock generations with solver on one slot: after each one, it takes the next
 // queued order on the same slot right away, without waiting for the next tick. It stops when no
 // order is queued, on a failure, or when the solver turns sick; then the slot is freed.
-func (b *BucketHandler) generate(key Key, solver SolverInterface[any], member string) {
+func (b *BucketHandler) generate(key string, solver SolverInterface[any], member string) {
 	ctx := context.Background()
 	name := solver.GetName()
 	defer func() {
@@ -506,22 +506,61 @@ func (b *BucketHandler) generate(key Key, solver SolverInterface[any], member st
 }
 
 // stockOne solves one product for the stock with solver and saves it. It reports success.
-func (b *BucketHandler) stockOne(ctx context.Context, key Key, solver SolverInterface[any]) bool {
-	prod, err := b.solve(key, solver, nil)
+func (b *BucketHandler) stockOne(ctx context.Context, key string, solver SolverInterface[any]) bool {
+	var params Params
+	if b.proxy != nil {
+		proxy, err := b.stockProxy(ctx, key)
+		if err != nil {
+			log.Warn("falha ao obter proxy para o estoque", "key", key, "err", err)
+			return false
+		}
+		params.Proxy = proxy
+	}
+	prod, err := b.solve(key, solver, params)
 	if err != nil {
-		log.Warn("falha ao gerar produto para o estoque", "key", key.String(), "err", err)
+		if params.Proxy != "" && errors.Is(err, ErrProxy) {
+			b.dropProxy(ctx, key, params.Proxy)
+		}
+		log.Warn("falha ao gerar produto para o estoque", "key", key, "err", err)
 		return false
 	}
 	if _, err := b.sm.Save(ctx, key, prod); err != nil {
-		log.Warn("falha ao salvar produto no estoque", "key", key.String(), "err", err)
+		log.Warn("falha ao salvar produto no estoque", "key", key, "err", err)
 		return false
 	}
 	b.redis.HIncrBy(ctx, redisKey(key, "gen"), "made", 1)
 	return true
 }
 
+// stockProxy returns the proxy the stock of key uses, asking the provider for one if there is none.
+func (b *BucketHandler) stockProxy(ctx context.Context, key string) (string, error) {
+	if p, ok := b.proxies.Load(key); ok {
+		return p.(string), nil
+	}
+	info, err := b.proxy.Get(ctx, key)
+	if err != nil {
+		return "", err
+	}
+	if info.Proxy == "" {
+		return "", fmt.Errorf("provedor devolveu proxy vazia para a chave %s", key)
+	}
+	p, _ := b.proxies.LoadOrStore(key, info.Proxy)
+	return p.(string), nil
+}
+
+// dropProxy discards the failed proxy of key so the next solve gets a new one, and reports it.
+// Only the first caller for that proxy reports, so concurrent failures report once.
+func (b *BucketHandler) dropProxy(ctx context.Context, key string, proxy string) {
+	if !b.proxies.CompareAndDelete(key, proxy) {
+		return
+	}
+	if err := b.proxy.Report(ctx, key, proxy, false); err != nil {
+		log.Warn("falha ao reportar proxy", "key", key, "err", err)
+	}
+}
+
 // isSick tells whether solver was sick at the last stock tick.
-func (b *BucketHandler) isSick(key Key, solver SolverInterface[any]) bool {
+func (b *BucketHandler) isSick(key string, solver SolverInterface[any]) bool {
 	states := b.solverStates(key)
 	i := slices.Index(b.solvers[key], solver)
 	return i >= 0 && i < len(states) && states[i].sick

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	crand "crypto/rand"
+	"errors"
 	"fmt"
 	log "log/slog"
 	"slices"
@@ -16,17 +17,19 @@ import (
 )
 
 type BucketHandler struct {
-	solvers map[Key][]SolverInterface[any]
-	stats   map[Key]*KeyStats
+	solvers map[string][]SolverInterface[any]
+	stats   map[string]*KeyStats
 
 	config atomic.Pointer[external.Config]        // current config, replaced whole on each load
 	sm     *external.SessionManager[Product[any]] // external stock of products, nil means no stock
+	proxy  *external.ProxyProvider[ProxyInfo]     // hands out proxies by key, nil means no provider
 
 	redis *redis.Client
 	id    string       // identifies this task in the inflight marks
 	seq   atomic.Int64 // numbers the stock reservations of this task
 
-	states sync.Map // Key -> []solverState, refreshed by every stock tick
+	states  sync.Map // key -> []solverState, refreshed by every stock tick
+	proxies sync.Map // key -> string, proxy the stock of the key uses until it fails
 }
 
 func NewBucketHandler() *BucketHandler {
@@ -36,7 +39,7 @@ func NewBucketHandler() *BucketHandler {
 		return nil
 	}
 
-	stats := make(map[Key]*KeyStats, len(registry))
+	stats := make(map[string]*KeyStats, len(registry))
 	for key := range registry {
 		stats[key] = &KeyStats{}
 	}
@@ -70,11 +73,13 @@ func (b *BucketHandler) GetProduct(req Request) (Product[any], error) {
 }
 
 // solve generates a product of key now with solver and records the generation in the global metrics.
-func (b *BucketHandler) solve(key Key, solver SolverInterface[any], params Params) (Product[any], error) {
+func (b *BucketHandler) solve(key string, solver SolverInterface[any], params Params) (Product[any], error) {
 	solver.AddInflights()
 	start := time.Now()
 	prod, err := NewProductBySolve(key, solver, params)
-	b.recordGeneration(key, solver.GetName(), time.Since(start), err)
+	if !errors.Is(err, ErrProxy) { // a bad proxy must not trip the solver's metrics
+		b.recordGeneration(key, solver.GetName(), time.Since(start), err)
+	}
 	solver.SubInflights()
 
 	return prod, err
@@ -82,7 +87,7 @@ func (b *BucketHandler) solve(key Key, solver SolverInterface[any], params Param
 
 // TODO: O report também pode ser a um sistema externo. Por exemplo: um gerenciador de proxy que precisa de um report de sucesso ou falha para poder gerenciar a proxy.
 // ReportUsage records whether a product of the named Solver worked when used.
-func (b *BucketHandler) ReportUsage(key Key, solver string, success bool) error {
+func (b *BucketHandler) ReportUsage(key string, solver string, success bool) error {
 	for _, s := range b.solvers[key] {
 		if s.GetName() == solver {
 			s.GetStatistic().AddUsage(time.Now(), success)
@@ -92,9 +97,9 @@ func (b *BucketHandler) ReportUsage(key Key, solver string, success bool) error 
 	return fmt.Errorf("nenhum Solver %q registrado com a chave fornecida", solver)
 }
 
-// TryGetSolver orders the Key's solvers by preference, adaptive score or fixed weight, per config.
+// TryGetSolver orders the key's solvers by preference, adaptive score or fixed weight, per config.
 // Callers take the first one with room.
-func (b *BucketHandler) TryGetSolver(key Key) ([]SolverInterface[any], error) {
+func (b *BucketHandler) TryGetSolver(key string) ([]SolverInterface[any], error) {
 	solvers := b.solvers[key]
 	if len(solvers) == 0 {
 		return nil, fmt.Errorf("nenhum Solver registrado com a chave fornecida")

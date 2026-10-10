@@ -49,7 +49,7 @@ func (b *BucketHandler) ApplyConfig(cfg external.Config) {
 	for key, limits := range cfg.SolverLimit {
 		for name := range limits {
 			if !slices.ContainsFunc(b.solvers[key], func(s SolverInterface[any]) bool { return s.GetName() == name }) {
-				log.Error("limite configurado para solver não registrado", "key", key.String(), "solver", name)
+				log.Error("limite configurado para solver não registrado", "key", key, "solver", name)
 			}
 		}
 	}
@@ -61,7 +61,7 @@ func (b *BucketHandler) ApplyConfig(cfg external.Config) {
 
 	for key := range cfg.Stock {
 		if _, ok := cfg.Routes[key]; !ok {
-			log.Error("estoque configurado para chave sem rota no session manager", "key", key.String())
+			log.Error("estoque configurado para chave sem rota no session manager", "key", key)
 		}
 	}
 	if b.sm != nil {

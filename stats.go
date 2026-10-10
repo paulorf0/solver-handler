@@ -93,26 +93,26 @@ const (
 	baseWeight = 0.002 // weight on the latency baseline: follows the last ~500
 )
 
-// KeyStats holds the request counter state of one Key in this task.
+// KeyStats holds the request counter state of one key in this task.
 type KeyStats struct {
 	failedIncr atomic.Int64 // global increments that failed to reach Redis
 }
 
-// redisKey names a Redis key of Key. The hash tag puts every key of one Key in the same slot,
+// redisKey names a Redis key of key. The hash tag puts every Redis key of one key in the same slot,
 // so the stock scripts can touch several of them.
-func redisKey(key Key, name string) string { return "{" + key.String() + "}:" + name }
+func redisKey(key string, name string) string { return "{" + key + "}:" + name }
 
-// busyKey holds the generations in progress of one solver of Key, from every task.
-func busyKey(key Key, solver string) string { return redisKey(key, "busy:"+solver) }
+// busyKey holds the generations in progress of one solver of key, from every task.
+func busyKey(key string, solver string) string { return redisKey(key, "busy:"+solver) }
 
-// stockKey holds the stock generations in progress of one solver of Key, from every task.
-func stockKey(key Key, solver string) string { return redisKey(key, "stock:"+solver) }
+// stockKey holds the stock generations in progress of one solver of key, from every task.
+func stockKey(key string, solver string) string { return redisKey(key, "stock:"+solver) }
 
-// solverGenKey holds the generation metrics of one solver of Key, from every task.
-func solverGenKey(key Key, solver string) string { return redisKey(key, "gen:"+solver) }
+// solverGenKey holds the generation metrics of one solver of key, from every task.
+func solverGenKey(key string, solver string) string { return redisKey(key, "gen:"+solver) }
 
-// countRequest adds 1 to the global request counter of Key in Redis, plus earlier failed increments.
-func (b *BucketHandler) countRequest(key Key) {
+// countRequest adds 1 to the global request counter of key in Redis, plus earlier failed increments.
+func (b *BucketHandler) countRequest(key string) {
 	if b.redis == nil {
 		return
 	}
@@ -124,7 +124,7 @@ func (b *BucketHandler) countRequest(key Key) {
 }
 
 // recordGenScript updates the moving latency mean, variance and baseline (successes only) and the
-// moving failure ratio of Key's generations, in the Key's metrics and in the solver's. The baseline
+// moving failure ratio of the key's generations, in the key's metrics and in the solver's. The baseline
 // stays frozen while the latency is above it × ARGV[5], so it does not learn a slowdown.
 // ARGV[1] is the latency in ms, -1 on failure. KEYS: gen, gen of the solver (same hash tag).
 var recordGenScript = redis.NewScript(`
@@ -155,9 +155,9 @@ return 1
 
 // The metrics below are best effort: a Redis error only loses one sample.
 
-// recordGeneration adds one generation of Key by solver, from the stock or solved now, to the
+// recordGeneration adds one generation of key by solver, from the stock or solved now, to the
 // global metrics.
-func (b *BucketHandler) recordGeneration(key Key, solver string, elapsed time.Duration, err error) {
+func (b *BucketHandler) recordGeneration(key string, solver string, elapsed time.Duration, err error) {
 	if b.redis == nil {
 		return
 	}
@@ -190,7 +190,7 @@ return pick
 // startNow picks the solver of a generation solved now: the first of order with room, or the
 // first one when all are full, and marks it busy. It never blocks: the limits only hold back the
 // stock. It returns the solver and the mark that finishNow removes.
-func (b *BucketHandler) startNow(key Key, order []SolverInterface[any]) (SolverInterface[any], string) {
+func (b *BucketHandler) startNow(key string, order []SolverInterface[any]) (SolverInterface[any], string) {
 	member := b.id + ":now:" + strconv.FormatInt(b.seq.Add(1), 10)
 	if b.redis == nil {
 		return order[0], member
@@ -210,7 +210,7 @@ func (b *BucketHandler) startNow(key Key, order []SolverInterface[any]) (SolverI
 }
 
 // finishNow removes the mark of a generation solved now.
-func (b *BucketHandler) finishNow(key Key, solver, member string) {
+func (b *BucketHandler) finishNow(key string, solver, member string) {
 	if b.redis != nil {
 		b.redis.ZRem(context.Background(), busyKey(key, solver), member)
 	}

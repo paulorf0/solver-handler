@@ -1,10 +1,16 @@
 package main
 
-import "sync/atomic"
+import (
+	"errors"
+	"sync/atomic"
+)
+
+// ErrProxy is wrapped by Solve when it failed because of the proxy.
+var ErrProxy = errors.New("falha na proxy")
 
 type SolverInterface[T any] interface {
 	GetName() string
-	GetKey() Key
+	GetKey() string
 	GetWeight() int
 	GetStatistic() *SolverStats
 	GetInflights() int
@@ -20,7 +26,7 @@ type SolverInterface[T any] interface {
 // BaseSolver is the "parent" struct: concrete solvers embed it and only implement Solve.
 type BaseSolver struct {
 	name      string // identifies the Solver among the solvers of the same key
-	key       Key
+	key       string
 	weight    uint8        // In percent, 0 - 100 %
 	inflights atomic.Int32 // Quantity of product currently being generated.
 	limit     atomic.Int32 // Concurrent limit, from the config. 0 means no limit.
@@ -28,12 +34,12 @@ type BaseSolver struct {
 	stats SolverStats
 }
 
-func NewBaseSolver(name string, key Key, weight uint8) BaseSolver {
+func NewBaseSolver(name string, key string, weight uint8) BaseSolver {
 	return BaseSolver{name: name, key: key, weight: weight}
 }
 
 func (b *BaseSolver) GetName() string            { return b.name }
-func (b *BaseSolver) GetKey() Key                { return b.key }
+func (b *BaseSolver) GetKey() string             { return b.key }
 func (b *BaseSolver) GetWeight() int             { return int(b.weight) }
 func (b *BaseSolver) GetStatistic() *SolverStats { return &b.stats }
 func (b *BaseSolver) GetInflights() int          { return int(b.inflights.Load()) }
@@ -51,5 +57,5 @@ func (b *BaseSolver) SubInflights() {
 	}
 }
 
-// registry maps each Key to the solvers that handle it.
-var registry = map[Key][]SolverInterface[any]{}
+// registry maps each key to the solvers that handle it.
+var registry = map[string][]SolverInterface[any]{}

@@ -1,19 +1,21 @@
 package main
 
-import (
-	"encoding/json"
-	"solver-handler/keys"
-)
-
 var Version = "v0.1"
 
-type Key = keys.Key
+// Params is what a client may send besides the key.
+type Params struct {
+	Proxy string `json:"proxy,omitempty"` // e.g. http://user:pass@host:port
+}
 
-// Params is the client data a Solver may need. It must stay an alias, so it keeps RawMessage's JSON methods.
-type Params = json.RawMessage
+// ProxyInfo is what the proxy provider returns; only Proxy is read here.
+type ProxyInfo struct {
+	Proxy string `json:"proxy"`
+}
 
-// Request is what a client asks for. Params is opaque here: only the Solver reads it, if it needs to.
+// Request is what a client asks for. Key picks the solvers; Labels are free attributes
+// (client, pool, region...) that other parts, like the proxy, may use.
 type Request struct {
-	Key    Key    `json:"Key"`
-	Params Params `json:"params,omitempty"`
+	Key    string            `json:"key"`
+	Labels map[string]string `json:"labels,omitempty"`
+	Params Params            `json:"params,omitzero"`
 }

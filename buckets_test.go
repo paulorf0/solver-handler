@@ -6,26 +6,26 @@ import (
 )
 
 var (
-	keyA     = Key{Name: "a", Client: "cli"}
-	keyB     = Key{Name: "b", Client: "cli"}
-	keyOutra = Key{Name: "outra", Client: "cli"}
-	keyAlfa  = Key{Name: "alfa", Client: "cli"}
-	keyBeta  = Key{Name: "beta", Client: "cli"}
+	keyA     = "a"
+	keyB     = "b"
+	keyOutra = "outra"
+	keyAlfa  = "alfa"
+	keyBeta  = "beta"
 )
 
 type fakeSolver struct {
-	key   Key
+	key   string
 	calls int
 	token any
 	err   error
 	stats SolverStats
 }
 
-func (f *fakeSolver) GetKey() Key { return f.key }
+func (f *fakeSolver) GetKey() string { return f.key }
 
 func (f *fakeSolver) GetWeight() int { return 0 }
 
-func (f *fakeSolver) GetName() string { return f.key.String() }
+func (f *fakeSolver) GetName() string { return f.key }
 
 func (f *fakeSolver) GetStatistic() *SolverStats { return &f.stats }
 
@@ -40,10 +40,10 @@ func (f *fakeSolver) Solve(Params) (any, error) {
 	return f.token, f.err
 }
 
-func newBuckets(key Key, solver SolverInterface[any]) *BucketHandler {
+func newBuckets(key string, solver SolverInterface[any]) *BucketHandler {
 	return &BucketHandler{
-		solvers: map[Key][]SolverInterface[any]{key: {solver}},
-		stats:   map[Key]*KeyStats{key: {}},
+		solvers: map[string][]SolverInterface[any]{key: {solver}},
+		stats:   map[string]*KeyStats{key: {}},
 	}
 }
 
@@ -146,8 +146,8 @@ func TestChaveParaSolver(t *testing.T) {
 	alfa := &fakeSolver{key: keyAlfa, token: "Token-alfa"}
 	beta := &fakeSolver{key: keyBeta, token: "Token-beta"}
 	b := &BucketHandler{
-		solvers: map[Key][]SolverInterface[any]{keyAlfa: {alfa}, keyBeta: {beta}},
-		stats:   map[Key]*KeyStats{keyAlfa: {}, keyBeta: {}},
+		solvers: map[string][]SolverInterface[any]{keyAlfa: {alfa}, keyBeta: {beta}},
+		stats:   map[string]*KeyStats{keyAlfa: {}, keyBeta: {}},
 	}
 
 	got, err := b.GetProduct(Request{Key: keyBeta})
