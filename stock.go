@@ -16,15 +16,17 @@ import (
 )
 
 const (
-	stockTick       = time.Second       // refill period of every task, also the brake window
-	ordersTTL       = 3 * stockTick / 2 // queued orders lapse if no leader renews them
-	defaultCoverage = 2 * time.Second   // coverage while the generation time is not measured
-	genLife         = 30 * time.Second  // an inflight mark lasts this long if its task dies mid generation
-	latencySigmas   = 2
-	rateTauUp       = 2 * time.Second // rate memory when demand rises: follows spikes fast
-	rateTauDown     = 2 * time.Second // rate memory when demand falls: less stock left to expire
-	metricsTTL      = 10 * time.Minute
-	breakerCut      = 0.25 // share of the ceiling left when the breaker trips
+	stockTick          = time.Second       // refill period of every task, also the brake window
+	ordersTTL          = 3 * stockTick / 2 // queued orders lapse if no tick renews them
+	lockTTL            = 3 * stockTick / 2 // above the tick's timeout: only a dead holder lets it lapse
+	defaultCoverage    = 2 * time.Second   // coverage while the generation time is not measured
+	genLife            = 30 * time.Second  // an inflight mark lasts this long if its task dies mid generation
+	proxyReportTimeout = 5 * time.Second
+	latencySigmas      = 2
+	rateTauUp          = 2 * time.Second // rate memory when demand rises: follows spikes fast
+	rateTauDown        = 2 * time.Second // rate memory when demand falls: less stock left to expire
+	metricsTTL         = 10 * time.Minute
+	breakerCut         = 0.25 // share of the ceiling left when the breaker trips
 
 	// The stock follows the demand only after requests arrived in each of the last sustainBins
 	// intervals of sustainBin (40s): one burst must not fill a stock that would expire unused.
@@ -156,8 +158,8 @@ func (b *BucketHandler) RunStock(ctx context.Context) {
 	}
 }
 
-// stockTick refreshes the solver states and, when this task leads the window (the first one to
-// claim it), plans the stock generations of the window:
+// stockTick refreshes the solver states and, when this task wins the key's lock and the window is
+// not planned yet, plans the stock generations of the window:
 //
 //	target = ceil(rate × coverage), or 0 until the demand is sustained
 //	plan   = target − pool − inflight, capped by the brake; started now on free stock slots,
@@ -165,7 +167,8 @@ func (b *BucketHandler) RunStock(ctx context.Context) {
 //
 // When the demand falls below what the stock can sell before it expires (rate × TTL < pool +
 // inflight), the stock stops and waits for sustained demand again.
-// Only the leader writes the rate and brake state, once per window, so it needs no script.
+// Only the lock holder reads, computes and writes the rate and brake state, so tasks never mix
+// their read-modify-write; it needs no script.
 func (b *BucketHandler) stockTick(ctx context.Context, key string) error {
 	cfg, ok := b.cfg().Stock[key]
 	solvers := b.solvers[key]
@@ -179,9 +182,12 @@ func (b *BucketHandler) stockTick(ctx context.Context, key string) error {
 	rateKey, brakeKey, genKey := redisKey(key, "rate"), redisKey(key, "brake"), redisKey(key, "gen")
 	snapsKey := redisKey(key, "snaps")
 
-	// One round trip for every task: the window lead, the solver states and what the leader needs.
+	// One round trip for every task: the lock, the solver states and what the lock holder needs.
+	// A pipeline runs its commands in order, so the reads after the lock are made under it when
+	// it is won, and discarded when it is not.
+	lockKey, token := redisKey(key, "lock"), b.id+":lock:"+strconv.FormatInt(b.seq.Add(1), 10)
 	pipe := b.redis.Pipeline()
-	lead := pipe.SetNX(ctx, redisKey(key, "leader:"+strconv.FormatInt(window, 10)), 1, 2*stockTick)
+	lock := pipe.SetNX(ctx, lockKey, token, lockTTL)
 	busy := make([]*redis.IntCmd, len(solvers))
 	stock := make([]*redis.IntCmd, len(solvers))
 	health := make([]*redis.SliceCmd, len(solvers))
@@ -195,7 +201,12 @@ func (b *BucketHandler) stockTick(ctx context.Context, key string) error {
 	totalCmd := pipe.Get(ctx, redisKey(key, "requests"))
 	brakeCmd := pipe.HMGet(ctx, brakeKey, brakeFields...)
 	genCmd := pipe.HMGet(ctx, genKey, "mean", "var", "fail", "made")
-	if _, err := pipe.Exec(ctx); err != nil && !errors.Is(err, redis.Nil) {
+	_, err := pipe.Exec(ctx)
+	if lock.Val() {
+		// Even when Exec failed: the lock may have been taken before the error.
+		defer b.unlock(lockKey, token)
+	}
+	if err != nil && !errors.Is(err, redis.Nil) {
 		return fmt.Errorf("falha ao ler a janela: %w", err)
 	}
 
@@ -207,11 +218,16 @@ func (b *BucketHandler) stockTick(ctx context.Context, key string) error {
 		inflight += states[i].stock
 	}
 	b.states.Store(key, states)
-	if !lead.Val() {
+	if !lock.Val() {
 		return nil
 	}
 
 	r, k, g := hvals(rateCmd), hvals(brakeCmd), hvals(genCmd)
+	// The limit and the coverage move once per window, and the reserve script stamps usedAt on
+	// every run: a window already stamped (or a later one, if this task's clock is behind) is done.
+	if k[fUsedAt] >= float64(window) {
+		return nil
+	}
 	total, _ := totalCmd.Float64()
 	rate, saveRate := nextRate(orElse(r[0], 0), r[1], r[2], total, nowMs)
 
@@ -308,6 +324,24 @@ func (b *BucketHandler) stockTick(ctx context.Context, key string) error {
 		go b.generate(key, solvers[idx-1], prefix+strconv.Itoa(i+1))
 	}
 	return nil
+}
+
+// unlockScript releases a lock only if it still belongs to the caller: after its TTL ran out,
+// another task may hold it.
+// KEYS: lock. ARGV: token.
+var unlockScript = redis.NewScript(`
+if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) end
+return 0
+`)
+
+// unlock releases the lock of a key taken with token. It does not use the tick's context, which
+// may be over by then; if it fails, the lock lapses by itself after lockTTL.
+func (b *BucketHandler) unlock(lockKey, token string) {
+	ctx, cancel := context.WithTimeout(context.Background(), stockTick)
+	defer cancel()
+	if err := unlockScript.Run(ctx, b.redis, []string{lockKey}, token).Err(); err != nil {
+		log.Warn("falha ao liberar o lock do estoque", "key", lockKey, "err", err)
+	}
 }
 
 // hvals parses the values of an HMGET, NaN where missing.
@@ -516,14 +550,23 @@ func (b *BucketHandler) stockOne(ctx context.Context, key string, solver SolverI
 		}
 		params.Proxy = proxy
 	}
-	prod, err := b.solve(key, solver, params)
-	if err != nil {
-		if params.Proxy != "" && errors.Is(err, ErrProxy) {
-			b.dropProxy(ctx, key, params.Proxy)
+	solveCtx, cancel := context.WithTimeout(ctx, seconds(b.TimeoutSolve(solver)))
+	prod, info := b.solve(solveCtx, key, solver, params)
+	cancel()
+
+	// Only a proxy error counts against the proxy: any other outcome means it worked.
+	if params.Proxy != "" {
+		if info.err != nil && external.ItsProxyError(info.errCode) {
+			b.dropProxy(key, params.Proxy)
+		} else {
+			b.reportProxy(key, params.Proxy, true)
 		}
-		log.Warn("falha ao gerar produto para o estoque", "key", key, "err", err)
+	}
+	if info.err != nil {
+		log.Warn("falha ao gerar produto para o estoque", "key", key, "err", info.err)
 		return false
 	}
+
 	if _, err := b.sm.Save(ctx, key, prod); err != nil {
 		log.Warn("falha ao salvar produto no estoque", "key", key, "err", err)
 		return false
@@ -550,13 +593,23 @@ func (b *BucketHandler) stockProxy(ctx context.Context, key string) (string, err
 
 // dropProxy discards the failed proxy of key so the next solve gets a new one, and reports it.
 // Only the first caller for that proxy reports, so concurrent failures report once.
-func (b *BucketHandler) dropProxy(ctx context.Context, key string, proxy string) {
+func (b *BucketHandler) dropProxy(key string, proxy string) {
 	if !b.proxies.CompareAndDelete(key, proxy) {
 		return
 	}
-	if err := b.proxy.Report(ctx, key, proxy, false); err != nil {
-		log.Warn("falha ao reportar proxy", "key", key, "err", err)
-	}
+	b.reportProxy(key, proxy, false)
+}
+
+// reportProxy tells the provider, in the background, whether proxy worked for key, so the
+// stock loop does not wait for it.
+func (b *BucketHandler) reportProxy(key string, proxy string, success bool) {
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), proxyReportTimeout)
+		defer cancel()
+		if err := b.proxy.Report(ctx, key, proxy, success); err != nil {
+			log.Warn("falha ao reportar proxy", "key", key, "success", success, "err", err)
+		}
+	}()
 }
 
 // isSick tells whether solver was sick at the last stock tick.

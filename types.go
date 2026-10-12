@@ -15,7 +15,8 @@ type ProxyInfo struct {
 // Request is what a client asks for. Key picks the solvers; Labels are free attributes
 // (client, pool, region...) that other parts, like the proxy, may use.
 type Request struct {
-	Key    string            `json:"key"`
-	Labels map[string]string `json:"labels,omitempty"`
-	Params Params            `json:"params,omitzero"`
+	Key     string            `json:"key"`
+	Labels  map[string]string `json:"labels,omitempty"`
+	Params  Params            `json:"params,omitzero"`
+	Timeout *float64          `json:"timeout"`
 }

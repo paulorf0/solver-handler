@@ -1,12 +1,23 @@
 package main
 
 import (
-	"errors"
+	"context"
+	"solver-handler/external"
 	"sync/atomic"
 )
 
-// ErrProxy is wrapped by Solve when it failed because of the proxy.
-var ErrProxy = errors.New("falha na proxy")
+// Info is the outcome of a Solve: err is nil on success, errCode is the http code of the
+// failure (0 when there is none).
+type Info struct {
+	err     error
+	errCode int
+}
+
+// solverFault tells whether the solve failed by the solver's fault. Failures that are not its
+// fault (proxy, target limit, no http code) must not touch its metrics.
+func (i Info) solverFault() bool {
+	return i.err != nil && external.ItsSolverError(i.errCode)
+}
 
 type SolverInterface[T any] interface {
 	GetName() string
@@ -20,7 +31,7 @@ type SolverInterface[T any] interface {
 	AddInflights()
 	SubInflights()
 
-	Solve(params Params) (T, error) // params: client data from Request, may be empty
+	Solve(ctx context.Context, params Params) (T, Info) // params: client data from Request, may be empty
 }
 
 // BaseSolver is the "parent" struct: concrete solvers embed it and only implement Solve.
@@ -44,8 +55,8 @@ func (b *BaseSolver) GetWeight() int             { return int(b.weight) }
 func (b *BaseSolver) GetStatistic() *SolverStats { return &b.stats }
 func (b *BaseSolver) GetInflights() int          { return int(b.inflights.Load()) }
 
-func (b *BaseSolver) GetLimit() int          { return int(b.limit.Load()) }
-func (b *BaseSolver) SetLimit(limit int)     { b.limit.Store(int32(limit)) }
+func (b *BaseSolver) GetLimit() int      { return int(b.limit.Load()) }
+func (b *BaseSolver) SetLimit(limit int) { b.limit.Store(int32(limit)) }
 
 func (b *BaseSolver) AddInflights() { b.inflights.Add(+1) }
 func (b *BaseSolver) SubInflights() {

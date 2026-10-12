@@ -27,11 +27,14 @@ type SolverStats struct {
 }
 
 type solverCounters struct {
-	genSuccess   float64 // Solver delivered a product
-	genFailure   float64 // Solver failed to deliver a product
-	usageSuccess float64 // product worked when used
-	usageFailure float64 // product was rejected when used
-	genElapsed   float64 // seconds summed over successful generations
+	genSuccess           float64 // Solver delivered a product
+	genFailure           float64 // Solver failed to deliver a product
+	usageSuccess         float64 // product worked when used
+	usageFailure         float64 // product was rejected when used
+	genElapsed           float64 // seconds summed over successful generations
+	w                    float64 // total weight of the latency samples
+	m2                   float64 // weighted sum of squared deviations, in seconds²
+	meanElapsedGenSucess float64 // weighted mean latency, in seconds
 }
 
 // decay ages the counters to now. Caller must hold the lock.
@@ -40,9 +43,9 @@ func (s *SolverStats) decay(now time.Time) {
 		return
 	}
 	if !s.updatedAt.IsZero() {
-		f := math.Pow(0.5, now.Sub(s.updatedAt).Seconds()/halfLife.Seconds())
+		f := math.Pow(0.5, now.Sub(s.updatedAt).Seconds()/halfLife.Seconds()) // (1/2)^(delta_t / halfLife)
 		c := &s.counters
-		for _, v := range []*float64{&c.genSuccess, &c.genFailure, &c.usageSuccess, &c.usageFailure, &c.genElapsed} {
+		for _, v := range []*float64{&c.genSuccess, &c.genFailure, &c.usageSuccess, &c.usageFailure, &c.genElapsed, &c.w} {
 			if *v *= f; *v < minDecayed {
 				*v = 0
 			}
@@ -50,21 +53,61 @@ func (s *SolverStats) decay(now time.Time) {
 		if c.genSuccess == 0 {
 			c.genElapsed = 0
 		}
+		// m2 follows w: a small variance (seconds²) is not a decayed-away weight. The mean keeps
+		// its value, since scaling every weight alike does not move it.
+		if c.m2 *= f; c.w == 0 {
+			c.m2 = 0
+		}
 	}
 	s.updatedAt = now
 }
 
-func (s *SolverStats) AddGeneration(now time.Time, elapsed time.Duration, err error) {
+func (s *SolverStats) AddGeneration(now time.Time, elapsed time.Duration, info Info) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	s.decay(now)
-	if err != nil {
-		s.counters.genFailure++
+	if info.err != nil {
+		// A failure that is not the solver's fault says nothing about it.
+		if info.solverFault() {
+			s.counters.genFailure++
+		}
 		return
 	}
+
 	s.counters.genSuccess++
 	s.counters.genElapsed += elapsed.Seconds()
+	// Weighted Welford with weight 1 per sample; decay scales w and m2 alike.
+	x := elapsed.Seconds()
+	s.counters.w++
+	d := x - s.counters.meanElapsedGenSucess
+	s.counters.meanElapsedGenSucess += d / s.counters.w
+	s.counters.m2 += d * (x - s.counters.meanElapsedGenSucess)
+}
+
+// deviation is the weighted standard deviation of the latency, in seconds. Caller must hold the lock.
+func (s *SolverStats) deviation() float64 {
+	if s.counters.w <= 0 {
+		return 0
+	}
+	return math.Sqrt(s.counters.m2 / s.counters.w)
+}
+
+// TimeoutGen returns the solve timeout in seconds from the latency metrics:
+//
+//	t = mean + 4 × deviation, clamped to [min, max]
+//
+// mean and deviation follow the decayed weights, not the samples' age. With no samples it
+// returns max.
+func (s *SolverStats) TimeoutGen(max, min float64) float64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.decay(time.Now())
+	if s.counters.w == 0 {
+		return max
+	}
+	return clamp(s.counters.meanElapsedGenSucess+4*s.deviation(), max, min)
 }
 
 func (s *SolverStats) AddUsage(now time.Time, success bool) {
@@ -157,12 +200,12 @@ return 1
 
 // recordGeneration adds one generation of key by solver, from the stock or solved now, to the
 // global metrics.
-func (b *BucketHandler) recordGeneration(key string, solver string, elapsed time.Duration, err error) {
+func (b *BucketHandler) recordGeneration(key string, solver string, elapsed time.Duration, err bool) {
 	if b.redis == nil {
 		return
 	}
 	ms := min(elapsed, genLife).Milliseconds()
-	if err != nil {
+	if err {
 		ms = -1
 	}
 	recordGenScript.Run(context.Background(), b.redis, []string{redisKey(key, "gen"), solverGenKey(key, solver)},
@@ -214,4 +257,8 @@ func (b *BucketHandler) finishNow(key string, solver, member string) {
 	if b.redis != nil {
 		b.redis.ZRem(context.Background(), busyKey(key, solver), member)
 	}
+}
+
+func clamp(val, max, min float64) float64 {
+	return math.Min(math.Max(val, min), max)
 }

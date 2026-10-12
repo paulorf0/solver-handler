@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	crand "crypto/rand"
-	"errors"
 	"fmt"
 	log "log/slog"
 	"slices"
@@ -17,6 +16,7 @@ import (
 )
 
 type BucketHandler struct {
+	//TODO: map[string]map[string]SolverInterface[any] - key -> solver name
 	solvers map[string][]SolverInterface[any]
 	stats   map[string]*KeyStats
 
@@ -69,20 +69,44 @@ func (b *BucketHandler) GetProduct(req Request) (Product[any], error) {
 	}
 	solver, member := b.startNow(key, order)
 	defer b.finishNow(key, solver.GetName(), member)
-	return b.solve(key, solver, req.Params)
+
+	// The solver's timeout, limited by the client's (in seconds).
+	t := b.TimeoutSolve(solver)
+	if req.Timeout != nil && *req.Timeout > 0 {
+		t = min(t, *req.Timeout)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), seconds(t))
+	defer cancel()
+
+	prod, info := b.solve(ctx, key, solver, req.Params)
+
+	return prod, info.err
 }
 
+const (
+	maxSolveTimeout = 30 // seconds, also the timeout while the solver's latency is not measured
+	minSolveTimeout = 2  // seconds
+)
+
+// TimeoutSolve returns the timeout of one solve by solver, in seconds.
+func (b *BucketHandler) TimeoutSolve(solver SolverInterface[any]) float64 {
+	return solver.GetStatistic().TimeoutGen(maxSolveTimeout, minSolveTimeout)
+}
+
+// seconds converts s seconds to a Duration.
+func seconds(s float64) time.Duration { return time.Duration(s * float64(time.Second)) }
+
 // solve generates a product of key now with solver and records the generation in the global metrics.
-func (b *BucketHandler) solve(key string, solver SolverInterface[any], params Params) (Product[any], error) {
+func (b *BucketHandler) solve(ctx context.Context, key string, solver SolverInterface[any], params Params) (Product[any], Info) {
 	solver.AddInflights()
 	start := time.Now()
-	prod, err := NewProductBySolve(key, solver, params)
-	if !errors.Is(err, ErrProxy) { // a bad proxy must not trip the solver's metrics
-		b.recordGeneration(key, solver.GetName(), time.Since(start), err)
+	prod, info := NewProductBySolve(ctx, key, solver, params)
+	if info.err == nil || info.solverFault() { // a failure that is not the solver's must not trip its metrics
+		b.recordGeneration(key, solver.GetName(), time.Since(start), info.err != nil)
 	}
 	solver.SubInflights()
 
-	return prod, err
+	return prod, info
 }
 
 // TODO: O report também pode ser a um sistema externo. Por exemplo: um gerenciador de proxy que precisa de um report de sucesso ou falha para poder gerenciar a proxy.

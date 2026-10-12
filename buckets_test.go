@@ -1,8 +1,10 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"testing"
+	"time"
 )
 
 var (
@@ -18,6 +20,7 @@ type fakeSolver struct {
 	calls int
 	token any
 	err   error
+	code  int
 	stats SolverStats
 }
 
@@ -35,9 +38,9 @@ func (f *fakeSolver) SubInflights()     {}
 func (f *fakeSolver) GetLimit() int     { return 0 }
 func (f *fakeSolver) SetLimit(int)      {}
 
-func (f *fakeSolver) Solve(Params) (any, error) {
+func (f *fakeSolver) Solve(context.Context, Params) (any, Info) {
 	f.calls++
-	return f.token, f.err
+	return f.token, Info{err: f.err, errCode: f.code}
 }
 
 func newBuckets(key string, solver SolverInterface[any]) *BucketHandler {
@@ -180,7 +183,7 @@ type embedSolver struct {
 	BaseSolver
 }
 
-func (*embedSolver) Solve(Params) (any, error) { return nil, nil }
+func (*embedSolver) Solve(context.Context, Params) (any, Info) { return nil, Info{} }
 
 func TestBaseSolver_Key(t *testing.T) {
 	s := &embedSolver{BaseSolver{key: keyAlfa}}
@@ -188,5 +191,52 @@ func TestBaseSolver_Key(t *testing.T) {
 	var _ SolverInterface[any] = s // embutir BaseSolver já satisfaz tudo menos Solve()
 	if s.GetKey() != keyAlfa {
 		t.Errorf("GetKey() = %q, quer %q", s.GetKey(), keyAlfa)
+	}
+}
+
+// --- erros e timeout do solve ---
+
+func TestGetProduct_SucessoNaoEntraEmPanico(t *testing.T) {
+	b := newBuckets(keyA, &fakeSolver{key: keyA, token: "ok"})
+
+	got, err := b.GetProduct(Request{Key: keyA, Params: Params{Proxy: "http://p"}})
+	if err != nil {
+		t.Fatalf("erro inesperado: %v", err)
+	}
+	if got.Params.Proxy != "http://p" {
+		t.Errorf("Params.Proxy = %q, quer %q", got.Params.Proxy, "http://p")
+	}
+}
+
+func TestAddGeneration_ErroQueNaoEDoSolver(t *testing.T) {
+	boom := errors.New("boom")
+	for _, code := range []int{0, 407, 429, 502} {
+		var s SolverStats
+		s.AddGeneration(time.Now(), time.Second, Info{err: boom, errCode: code})
+		if c := s.Snapshot(time.Now()); c.genFailure != 0 || c.genSuccess != 0 || c.w != 0 {
+			t.Errorf("código %d: contadores = %+v, quer zerados", code, c)
+		}
+	}
+
+	var s SolverStats
+	s.AddGeneration(time.Now(), time.Second, Info{err: boom, errCode: 500})
+	if c := s.Snapshot(time.Now()); c.genFailure != 1 {
+		t.Errorf("código 500: genFailure = %v, quer 1", c.genFailure)
+	}
+}
+
+func TestTimeoutGen(t *testing.T) {
+	var s SolverStats
+	if got := s.TimeoutGen(30, 2); got != 30 {
+		t.Errorf("sem amostras: TimeoutGen = %v, quer 30", got)
+	}
+
+	// média 4s, desvio 1s -> 4 + 4×1 = 8s
+	now := time.Now()
+	for _, d := range []time.Duration{3 * time.Second, 5 * time.Second} {
+		s.AddGeneration(now, d, Info{})
+	}
+	if got := s.TimeoutGen(30, 2); got < 7.99 || got > 8.01 {
+		t.Errorf("TimeoutGen = %v, quer 8", got)
 	}
 }
