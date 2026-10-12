@@ -7,16 +7,32 @@ import (
 )
 
 // Info is the outcome of a Solve: err is nil on success, errCode is the http code of the
-// failure (0 when there is none).
+// failure (0 when there is none). A solver with its own codes sets errKind.
 type Info struct {
 	err     error
 	errCode int
+	errKind external.ErrKind // KindUnset: derived from errCode
+}
+
+// kind returns the class of the failure, KindUnset on success.
+func (i Info) kind() external.ErrKind {
+	switch {
+	case i.err == nil:
+		return external.KindUnset
+	case i.errKind != external.KindUnset:
+		return i.errKind
+	}
+	return external.KindOf(i.errCode)
 }
 
 // solverFault tells whether the solve failed by the solver's fault. Failures that are not its
-// fault (proxy, target limit, no http code) must not touch its metrics.
-func (i Info) solverFault() bool {
-	return i.err != nil && external.ItsSolverError(i.errCode)
+// fault (proxy, target limit, client, transient) must not touch its metrics.
+func (i Info) solverFault() bool { return i.kind() == external.KindSolver }
+
+// retryable tells whether another solver may succeed where this solve failed.
+func (i Info) retryable() bool {
+	k := i.kind()
+	return k == external.KindSolver || k == external.KindTemporary
 }
 
 type SolverInterface[T any] interface {

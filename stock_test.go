@@ -205,7 +205,7 @@ func TestGetProduct_PrazoDoSolveEODoSolver(t *testing.T) {
 		}
 		b := newBuckets(keyA, solver)
 
-		if _, err := b.GetProduct(Request{Key: keyA, Timeout: &client}); err != nil {
+		if _, err := b.GetProduct(context.Background(), Request{Key: keyA, Timeout: &client}); err != nil {
 			t.Fatalf("erro inesperado: %v", err)
 		}
 		if deadline <= (maxSolveTimeout-1)*time.Second || deadline > maxSolveTimeout*time.Second {
@@ -225,7 +225,7 @@ func TestGetProduct_OrcamentoEsgotadoVaiParaOEstoque(t *testing.T) {
 
 	budget := 0.05
 	start := time.Now()
-	_, err := env.b.GetProduct(Request{Key: keyA, Timeout: &budget})
+	_, err := env.b.GetProduct(context.Background(), Request{Key: keyA, Timeout: &budget})
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("err = %v, quer prazo esgotado", err)
 	}
@@ -239,5 +239,88 @@ func TestGetProduct_OrcamentoEsgotadoVaiParaOEstoque(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("o produto da tentativa em andamento não foi para o estoque")
+	}
+}
+
+// --- cancelamento pelo cliente ---
+
+func TestGetProduct_ClienteJaCanceladoNaoResolve(t *testing.T) {
+	solver := &fakeSolver{key: keyA, token: "ok"}
+	env := newStockEnv(t, solver)
+	env.b.proxy, env.b.redis = nil, nil
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := env.b.GetProduct(ctx, Request{Key: keyA}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, quer context.Canceled", err)
+	}
+	if solver.calls != 0 {
+		t.Errorf("calls = %d, quer 0: o cliente já tinha saído", solver.calls)
+	}
+	env.noSave(t)
+}
+
+func TestGetProduct_ClienteCancelaDuranteOSolve(t *testing.T) {
+	started, release := make(chan struct{}), make(chan struct{})
+	solveErr := make(chan error, 1)
+	solver := &funcSolver{BaseSolver: BaseSolver{name: keyA, key: keyA}}
+	solver.fn = func(ctx context.Context, _ Params) (any, Info) {
+		close(started)
+		<-release
+		solveErr <- ctx.Err()
+		return "tarde", Info{}
+	}
+	env := newStockEnv(t, solver)
+	env.b.proxy, env.b.redis = nil, nil
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		<-started
+		cancel()
+	}()
+	start := time.Now()
+	_, err := env.b.GetProduct(ctx, Request{Key: keyA})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, quer context.Canceled", err)
+	}
+	if took := time.Since(start); took > time.Second {
+		t.Errorf("GetProduct levou %v, quer voltar assim que o cliente cancela", took)
+	}
+
+	// O solve continua após o cancelamento e o produto vai para o estoque.
+	close(release)
+	if err := <-solveErr; err != nil {
+		t.Errorf("ctx do solve = %v, o cancelamento do cliente não deve chegar ao solve", err)
+	}
+	select {
+	case p := <-env.saved:
+		if p.Token != "tarde" {
+			t.Errorf("produto salvo = %+v, quer o da tentativa em andamento", p)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("o produto da tentativa em andamento não foi para o estoque")
+	}
+}
+
+func TestGetProduct_PrazoDoClienteAntesDoOrcamento(t *testing.T) {
+	solver := &funcSolver{BaseSolver: BaseSolver{name: keyA, key: keyA}}
+	solver.fn = func(context.Context, Params) (any, Info) {
+		time.Sleep(300 * time.Millisecond)
+		return "tarde", Info{}
+	}
+	b := newBuckets(keyA, solver)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	_, err := b.GetProduct(ctx, Request{Key: keyA}) // orçamento padrão de 30s
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("err = %v, quer o prazo do cliente", err)
+	}
+	if err != ctx.Err() {
+		t.Errorf("err = %v, quer o erro do próprio ctx do cliente, não o do orçamento", err)
+	}
+	if took := time.Since(start); took > 250*time.Millisecond {
+		t.Errorf("GetProduct levou %v, quer voltar no prazo do cliente", took)
 	}
 }

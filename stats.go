@@ -232,6 +232,19 @@ func (b *BucketHandler) recordGeneration(key string, solver string, elapsed time
 		ms, genWeight, baseWeight, metricsTTL.Milliseconds(), b.cfg().Stock[key].LatencyFactor)
 }
 
+// recordThrottle counts one target limit answer of key; the stock leader brakes the key when the
+// counter moves.
+func (b *BucketHandler) recordThrottle(key string) {
+	if b.redis == nil {
+		return
+	}
+	ctx, genKey := context.Background(), redisKey(key, "gen")
+	pipe := b.redis.Pipeline()
+	pipe.HIncrBy(ctx, genKey, "throttled", 1)
+	pipe.PExpire(ctx, genKey, metricsTTL)
+	pipe.Exec(ctx)
+}
+
 // pickNowScript marks busy the first solver of the preference order with room, or the first one
 // when all are full, and returns its position (1-based).
 // KEYS: busy of each solver, in preference order (same hash tag). ARGV: 5.. limit of each solver.

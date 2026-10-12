@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"solver-handler/external"
 	"testing"
 	"time"
 )
@@ -21,6 +22,7 @@ type fakeSolver struct {
 	token any
 	err   error
 	code  int
+	kind  external.ErrKind
 	stats SolverStats
 }
 
@@ -40,7 +42,7 @@ func (f *fakeSolver) SetLimit(int)      {}
 
 func (f *fakeSolver) Solve(context.Context, Params) (any, Info) {
 	f.calls++
-	return f.token, Info{err: f.err, errCode: f.code}
+	return f.token, Info{err: f.err, errCode: f.code, errKind: f.kind}
 }
 
 func newBuckets(key string, solver SolverInterface[any]) *BucketHandler {
@@ -54,7 +56,7 @@ func TestGetProduct_SemEstoqueResolveNaHora(t *testing.T) {
 	solver := &fakeSolver{key: keyA, token: "Solver"}
 	b := newBuckets(keyA, solver)
 
-	got, err := b.GetProduct(Request{Key: keyA})
+	got, err := b.GetProduct(context.Background(), Request{Key: keyA})
 	if err != nil {
 		t.Fatalf("erro inesperado: %v", err)
 	}
@@ -73,7 +75,7 @@ func TestGetProduct_ErroDoSolver(t *testing.T) {
 	boom := errors.New("boom")
 	b := newBuckets(keyA, &fakeSolver{key: keyA, err: boom})
 
-	_, err := b.GetProduct(Request{Key: keyA})
+	_, err := b.GetProduct(context.Background(), Request{Key: keyA})
 	if !errors.Is(err, boom) {
 		t.Errorf("err = %v, quer %v", err, boom)
 	}
@@ -82,7 +84,7 @@ func TestGetProduct_ErroDoSolver(t *testing.T) {
 func TestGetProduct_ChaveInexistente(t *testing.T) {
 	b := newBuckets(keyA, &fakeSolver{key: keyA})
 
-	if _, err := b.GetProduct(Request{Key: keyOutra}); err == nil {
+	if _, err := b.GetProduct(context.Background(), Request{Key: keyOutra}); err == nil {
 		t.Error("quer erro para chave inexistente")
 	}
 }
@@ -91,7 +93,7 @@ func TestGetProduct_SemSolver(t *testing.T) {
 	b := newBuckets(keyA, &fakeSolver{key: keyA})
 	delete(b.solvers, keyA)
 
-	if _, err := b.GetProduct(Request{Key: keyA}); err == nil {
+	if _, err := b.GetProduct(context.Background(), Request{Key: keyA}); err == nil {
 		t.Error("quer erro para chave sem Solver e sem estoque")
 	}
 }
@@ -153,7 +155,7 @@ func TestChaveParaSolver(t *testing.T) {
 		stats:   map[string]*KeyStats{keyAlfa: {}, keyBeta: {}},
 	}
 
-	got, err := b.GetProduct(Request{Key: keyBeta})
+	got, err := b.GetProduct(context.Background(), Request{Key: keyBeta})
 	if err != nil {
 		t.Fatalf("erro inesperado: %v", err)
 	}
@@ -199,7 +201,7 @@ func TestBaseSolver_Key(t *testing.T) {
 func TestGetProduct_SucessoNaoEntraEmPanico(t *testing.T) {
 	b := newBuckets(keyA, &fakeSolver{key: keyA, token: "ok"})
 
-	got, err := b.GetProduct(Request{Key: keyA, Params: Params{Proxy: "http://p"}})
+	got, err := b.GetProduct(context.Background(), Request{Key: keyA, Params: Params{Proxy: "http://p"}})
 	if err != nil {
 		t.Fatalf("erro inesperado: %v", err)
 	}
@@ -219,8 +221,9 @@ func TestAddGeneration_ErroQueNaoEDoSolver(t *testing.T) {
 	}
 
 	var s SolverStats
-	s.AddGeneration(time.Now(), time.Second, Info{err: boom, errCode: 500})
-	if c := s.Snapshot(time.Now()); c.genFailure != 1 {
+	now := time.Now()
+	s.AddGeneration(now, time.Second, Info{err: boom, errCode: 500})
+	if c := s.Snapshot(now); c.genFailure != 1 {
 		t.Errorf("código 500: genFailure = %v, quer 1", c.genFailure)
 	}
 }
@@ -270,7 +273,7 @@ func TestGetProduct_NovaTentativaNoProximoSolver(t *testing.T) {
 	a := &fakeSolver{key: "a", err: errors.New("falha"), code: 500}
 	b := &fakeSolver{key: "b", token: "B"}
 
-	got, err := newPair(a, b).GetProduct(Request{Key: keyA})
+	got, err := newPair(a, b).GetProduct(context.Background(), Request{Key: keyA})
 	if err != nil || got.Token != "B" {
 		t.Fatalf("got = %v, err = %v; quer o produto de B", got.Token, err)
 	}
@@ -282,7 +285,7 @@ func TestGetProduct_NovaTentativaNoProximoSolver(t *testing.T) {
 func TestGetProduct_TresTentativas(t *testing.T) {
 	solver := &fakeSolver{key: keyA, err: errors.New("falha"), code: 500}
 
-	if _, err := newBuckets(keyA, solver).GetProduct(Request{Key: keyA}); err == nil {
+	if _, err := newBuckets(keyA, solver).GetProduct(context.Background(), Request{Key: keyA}); err == nil {
 		t.Fatal("quer erro")
 	}
 	if solver.calls != solveTries {
@@ -293,7 +296,7 @@ func TestGetProduct_TresTentativas(t *testing.T) {
 func TestGetProduct_ErroDeProxyNaoRepete(t *testing.T) {
 	solver := &fakeSolver{key: keyA, err: errors.New("407"), code: 407}
 
-	newBuckets(keyA, solver).GetProduct(Request{Key: keyA})
+	newBuckets(keyA, solver).GetProduct(context.Background(), Request{Key: keyA})
 	if solver.calls != 1 {
 		t.Errorf("calls = %d, quer 1: a proxy do cliente falharia de novo", solver.calls)
 	}
@@ -306,12 +309,12 @@ func TestGetProduct_PulaSolverDoente(t *testing.T) {
 	h.states.Store(keyA, []solverState{{sick: true}, {}})
 
 	for range probeRequests - 1 {
-		if got, _ := h.GetProduct(Request{Key: keyA}); got.Token != "B" {
+		if got, _ := h.GetProduct(context.Background(), Request{Key: keyA}); got.Token != "B" {
 			t.Fatalf("Token = %v, quer B: A está doente", got.Token)
 		}
 	}
 	// Na décima requisição A recebe a sonda.
-	if got, _ := h.GetProduct(Request{Key: keyA}); got.Token != "A" {
+	if got, _ := h.GetProduct(context.Background(), Request{Key: keyA}); got.Token != "A" {
 		t.Errorf("Token = %v, quer A (sonda)", got.Token)
 	}
 	if a.calls != 1 || b.calls != probeRequests-1 {
@@ -325,7 +328,7 @@ func TestGetProduct_NovaTentativaSoEmSolverSaudavel(t *testing.T) {
 	h := newPair(a, b)
 	h.states.Store(keyA, []solverState{{}, {sick: true}})
 
-	h.GetProduct(Request{Key: keyA})
+	h.GetProduct(context.Background(), Request{Key: keyA})
 	if a.calls != solveTries || b.calls != 0 {
 		t.Errorf("calls A = %d, B = %d; quer %d, 0: só A está saudável", a.calls, b.calls, solveTries)
 	}
@@ -337,8 +340,93 @@ func TestGetProduct_TodosDoentesSemNovaTentativa(t *testing.T) {
 	h := newPair(a, b)
 	h.states.Store(keyA, []solverState{{sick: true}, {sick: true}})
 
-	h.GetProduct(Request{Key: keyA})
+	h.GetProduct(context.Background(), Request{Key: keyA})
 	if a.calls != 1 || b.calls != 0 {
 		t.Errorf("calls A = %d, B = %d; quer 1, 0", a.calls, b.calls)
+	}
+}
+
+// --- classe do erro do Solve ---
+
+func TestKindOf(t *testing.T) {
+	cases := map[int]external.ErrKind{
+		0:    external.KindTemporary,
+		400:  external.KindClient,
+		403:  external.KindSolver,
+		407:  external.KindProxy,
+		422:  external.KindClient,
+		429:  external.KindTargetLimit,
+		500:  external.KindSolver,
+		503:  external.KindTemporary,
+		9001: external.KindSolver, // código desconhecido é culpa do solver
+	}
+	for code, want := range cases {
+		if got := external.KindOf(code); got != want {
+			t.Errorf("KindOf(%d) = %v, quer %v", code, got, want)
+		}
+	}
+}
+
+func TestInfo_KindDoSolverSobrepoeOCodigo(t *testing.T) {
+	boom := errors.New("boom")
+	if k := (Info{err: boom, errCode: 500, errKind: external.KindClient}).kind(); k != external.KindClient {
+		t.Errorf("kind = %v, quer KindClient: a classe do solver vale mais que o código", k)
+	}
+	if k := (Info{errCode: 500}).kind(); k != external.KindUnset {
+		t.Errorf("kind sem erro = %v, quer KindUnset", k)
+	}
+}
+
+// Cada classe de erro: quantas vezes A e B são chamados e se A é punido.
+func TestGetProduct_ReacaoPorClasseDeErro(t *testing.T) {
+	cases := []struct {
+		name   string
+		code   int
+		kind   external.ErrKind
+		callsA int
+		callsB int
+		punish bool
+	}{
+		{"solver", 500, 0, 1, 1, true},
+		{"temporario", 503, 0, 1, 1, false},
+		{"proxy", 407, 0, 1, 0, false},
+		{"limite do destino", 429, 0, 1, 0, false},
+		{"cliente", 400, 0, 1, 0, false},
+		{"código próprio do cliente", 9001, external.KindClient, 1, 0, false},
+		{"código próprio temporário", 9002, external.KindTemporary, 1, 1, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			a := &fakeSolver{key: "a", err: errors.New("falha"), code: c.code, kind: c.kind}
+			b := &fakeSolver{key: "b", token: "B"}
+
+			newPair(a, b).GetProduct(context.Background(), Request{Key: keyA})
+			if a.calls != c.callsA || b.calls != c.callsB {
+				t.Errorf("calls A = %d, B = %d; quer %d, %d", a.calls, b.calls, c.callsA, c.callsB)
+			}
+			punished := a.stats.Snapshot(time.Now()).genFailure > 0
+			if punished != c.punish {
+				t.Errorf("A punido = %v, quer %v", punished, c.punish)
+			}
+		})
+	}
+}
+
+func TestNextLimit_LimiteDoDestinoFreia(t *testing.T) {
+	cfg := external.StockConfig{MaxPerSecond: 40, Cooldown: 30}
+	k := make([]float64, len(brakeFields))
+	k[fLimit], k[fLimited], k[fUsed], k[fUsedAt] = 40, 9, 40, 9 // janela 9 saturada no teto
+	now := 1e6
+
+	limit, _, coolUntil, tripped := nextLimit(cfg, k, 2, 0, now, 10, true)
+	if !tripped || limit != 40*breakerCut {
+		t.Errorf("limit = %v, tripped = %v; quer %v, true", limit, tripped, 40*breakerCut)
+	}
+	if coolUntil != now+30_000 {
+		t.Errorf("coolUntil = %v, quer %v", coolUntil, now+30_000)
+	}
+
+	if limit, _, _, tripped := nextLimit(cfg, k, 2, 0, now, 10, false); tripped || limit != 40 {
+		t.Errorf("sem 429: limit = %v, tripped = %v; quer 40, false", limit, tripped)
 	}
 }

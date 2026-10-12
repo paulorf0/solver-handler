@@ -31,29 +31,35 @@ var (
 	ErrInvalidResponse = errors.New("resposta inválida do sistema externo")
 )
 
-// notSolverError holds the http codes that are not the solver's fault. Code 0 (no http code,
-// e.g. network or context errors) is not the solver's fault either.
-var notSolverError = map[int]error{
-	// TODO: adicionar todos os erros.
-	0:   nil,
-	502: ErrBadGateway,
-	503: ErrServiceUnavailable,
-	504: ErrGatewayTimeout,
-	407: ErrProxyAuthRequired,
-	429: ErrTooManyRequests,
+// ErrKind classifies a failure by whose fault it is, which sets how to react to it.
+type ErrKind int
+
+const (
+	KindUnset       ErrKind = iota // not set: derived from the http code
+	KindSolver                     // the solver failed: punish it and try another
+	KindProxy                      // the proxy failed: drop it, another solver would fail too
+	KindTemporary                  // transient: try another solver, do not punish
+	KindTargetLimit                // the target limits the key: slow the key down, do not retry
+	KindClient                     // invalid client params: do not retry, do not punish
+)
+
+// codeKind maps http codes to their kind. Code 0 (no http code, e.g. network or context
+// errors) is temporary; codes not listed are the solver's fault.
+var codeKind = map[int]ErrKind{
+	0:   KindTemporary,
+	400: KindClient,
+	407: KindProxy,
+	422: KindClient,
+	429: KindTargetLimit,
+	502: KindTemporary,
+	503: KindTemporary,
+	504: KindTemporary,
 }
 
-// proxyError holds the http codes that only the proxy returns.
-var proxyError = map[int]error{
-	407: ErrProxyAuthRequired,
-}
-
-func ItsSolverError(code int) bool {
-	_, ok := notSolverError[code]
-	return !ok
-}
-
-func ItsProxyError(code int) bool {
-	_, ok := proxyError[code]
-	return ok
+// KindOf returns the kind of a failure with the given http code.
+func KindOf(code int) ErrKind {
+	if k, ok := codeKind[code]; ok {
+		return k
+	}
+	return KindSolver
 }

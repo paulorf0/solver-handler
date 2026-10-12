@@ -35,7 +35,7 @@ const (
 )
 
 // brakeFields are the fields of the brake hash, in the order stockTick reads them.
-var brakeFields = []string{"limit", "cover", "limited", "used", "usedAt", "satSince", "coolUntil", "made", "expired", "waste"}
+var brakeFields = []string{"limit", "cover", "limited", "used", "usedAt", "satSince", "coolUntil", "made", "expired", "waste", "throttled"}
 
 const (
 	fLimit     = iota // stock limit, generations/s
@@ -48,6 +48,7 @@ const (
 	fMade             // made counter at the last window
 	fExpired          // session manager's expired counter at the last window
 	fWaste            // moving share of the generations that expired
+	fThrottled        // target limit counter at the last window
 )
 
 // reserveScript plans the stock generations of a window in one step, so two tasks never plan the
@@ -200,7 +201,7 @@ func (b *BucketHandler) stockTick(ctx context.Context, key string) error {
 	snapsCmd := pipe.LRange(ctx, snapsKey, 0, sustainBins)
 	totalCmd := pipe.Get(ctx, redisKey(key, "requests"))
 	brakeCmd := pipe.HMGet(ctx, brakeKey, brakeFields...)
-	genCmd := pipe.HMGet(ctx, genKey, "mean", "var", "fail", "made")
+	genCmd := pipe.HMGet(ctx, genKey, "mean", "var", "fail", "made", "throttled")
 	_, err := pipe.Exec(ctx)
 	if lock.Val() {
 		// Even when Exec failed: the lock may have been taken before the error.
@@ -249,8 +250,13 @@ func (b *BucketHandler) stockTick(ctx context.Context, key string) error {
 		snaps = append([]float64{total}, snaps...)[:min(len(snaps)+1, sustainBins+1)]
 	}
 
-	limit, satSince, coolUntil, tripped := nextLimit(cfg, k, rate, orElse(g[2], 0), nowMs, window)
-	if tripped {
+	throttledTotal := orElse(g[4], 0)
+	throttled := throttledTotal > 0 && throttledTotal != orElse(k[fThrottled], 0) // != also catches a counter that expired and restarted
+	limit, satSince, coolUntil, tripped := nextLimit(cfg, k, rate, orElse(g[2], 0), nowMs, window, throttled)
+	switch {
+	case throttled:
+		log.Warn("destino limitando a chave, estoque freado", "key", key, "limite", limit)
+	case tripped:
 		log.Warn("disjuntor do estoque aberto", "key", key, "limite", limit)
 	}
 
@@ -295,7 +301,7 @@ func (b *BucketHandler) stockTick(ctx context.Context, key string) error {
 		pipe.PExpire(ctx, rateKey, metricsTTL)
 	}
 	pipe.HSet(ctx, brakeKey, "limit", limit, "cover", cover, "satSince", satSince, "coolUntil", coolUntil,
-		"made", made, "expired", expired, "waste", waste)
+		"made", made, "expired", expired, "waste", waste, "throttled", throttledTotal)
 	pipe.PExpire(ctx, brakeKey, metricsTTL)
 
 	// Always runs: with nothing missing it empties the queued orders.
@@ -407,8 +413,8 @@ func nextRate(rate, prev, at, total, now float64) (float64, bool) {
 // nextLimit moves the stock limit (generations/s) of a window: ×1.5 after a saturated window,
 // unless cooling down after a trip; otherwise toward 2× the last use. Never below the rate nor
 // above the ceiling. Saturated at the ceiling with failing generation for SaturatedFor trips the
-// breaker. k holds the brake fields.
-func nextLimit(cfg external.StockConfig, k []float64, rate, fail, now float64, window int64) (limit, satSince, coolUntil float64, tripped bool) {
+// breaker. A target limit (throttled) trips it at once. k holds the brake fields.
+func nextLimit(cfg external.StockConfig, k []float64, rate, fail, now float64, window int64, throttled bool) (limit, satSince, coolUntil float64, tripped bool) {
 	maxps := cfg.MaxPerSecond
 	limit, satSince, coolUntil = orElse(k[fLimit], maxps), orElse(k[fSatSince], 0), orElse(k[fCoolUntil], 0)
 	last := float64(window - 1)
@@ -427,6 +433,9 @@ func nextLimit(cfg external.StockConfig, k []float64, rate, fail, now float64, w
 	floor := max(1, min(rate, maxps))
 	limit = max(floor, min(limit, maxps))
 
+	if throttled {
+		return max(floor, min(limit, maxps*breakerCut)), 0, now + float64(cfg.Cooldown*1000), true
+	}
 	if cfg.SaturatedFor <= 0 || !saturated || limit < maxps || cfg.MaxFailRatio <= 0 || fail <= cfg.MaxFailRatio {
 		return limit, 0, coolUntil, false
 	}
@@ -556,7 +565,7 @@ func (b *BucketHandler) stockOne(ctx context.Context, key string, solver SolverI
 
 	// Only a proxy error counts against the proxy: any other outcome means it worked.
 	if params.Proxy != "" {
-		if info.err != nil && external.ItsProxyError(info.errCode) {
+		if info.kind() == external.KindProxy {
 			b.dropProxy(key, params.Proxy)
 		} else {
 			b.reportProxy(key, params.Proxy, true)

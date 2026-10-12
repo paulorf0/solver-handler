@@ -50,12 +50,13 @@ func NewBucketHandler() *BucketHandler {
 
 // TODO: Criar uma struct de erro com informações de métricas importantes para avaliação.
 // GetProduct returns a product from the stock or solves one now, in up to solveTries attempts.
-func (b *BucketHandler) GetProduct(req Request) (Product[any], error) {
+func (b *BucketHandler) GetProduct(ctxClient context.Context, req Request) (Product[any], error) {
 	budget := float64(maxSolveTimeout)
 	if req.Timeout != nil && *req.Timeout > 0 {
 		budget = *req.Timeout
 	}
-	deadline := time.Now().Add(seconds(budget))
+	ctx, cancel := context.WithTimeout(ctxClient, seconds(budget))
+	defer cancel()
 
 	key := req.Key
 	if _, ok := b.stats[key]; !ok {
@@ -65,9 +66,20 @@ func (b *BucketHandler) GetProduct(req Request) (Product[any], error) {
 
 	// Any failure of the external stock falls back to solving now.
 	if b.sm != nil {
-		if product, err := b.sm.Get(context.Background(), key); err == nil {
+		if product, err := b.sm.Get(ctx, key); err == nil {
+			if ctx.Err() != nil { // the caller left, so give the product back
+				go func() {
+					if _, err := b.sm.Save(context.Background(), key, product); err != nil {
+						log.Warn("falha ao devolver produto ao estoque", "key", key, "err", err)
+					}
+				}()
+				return Product[any]{}, ctxError(ctxClient, budget)
+			}
 			return product, nil
 		}
+	}
+	if ctx.Err() != nil {
+		return Product[any]{}, ctxError(ctxClient, budget)
 	}
 
 	order, err := b.TryGetSolver(key)
@@ -78,16 +90,16 @@ func (b *BucketHandler) GetProduct(req Request) (Product[any], error) {
 	candidates := b.firstCandidates(key, order)
 	var lastErr error
 	for range solveTries {
-		solver, r, late := b.attemptNow(key, candidates, req.Params, deadline)
-		if late {
-			return Product[any]{}, fmt.Errorf("orçamento de %gs esgotado: %w", budget, context.DeadlineExceeded)
+		solver, r, gone := b.attemptNow(ctx, key, candidates, req.Params)
+		if gone {
+			return Product[any]{}, ctxError(ctxClient, budget)
 		}
 		if r.info.err == nil {
 			return r.prod, nil
 		}
 		lastErr = r.info.err
-		// The client's proxy would fail on another solver too.
-		if external.ItsProxyError(r.info.errCode) || !time.Now().Before(deadline) {
+		// Proxy, target limit and client errors would fail on another solver too.
+		if !r.info.retryable() || ctx.Err() != nil {
 			break
 		}
 		if candidates = b.retryCandidates(key, order, solver); len(candidates) == 0 {
@@ -108,27 +120,33 @@ type attemptResult struct {
 	info Info
 }
 
-// attemptNow solves one product with the first candidate with room. Past deadline it returns
-// late, and the product goes to the stock.
-func (b *BucketHandler) attemptNow(key string, candidates []SolverInterface[any], params Params, deadline time.Time) (SolverInterface[any], attemptResult, bool) {
+// ctxError is the error of a finished GetProduct context: the caller's own, or the budget running out.
+func ctxError(client context.Context, budget float64) error {
+	if err := client.Err(); err != nil {
+		return err
+	}
+	return fmt.Errorf("orçamento de %gs esgotado: %w", budget, context.DeadlineExceeded)
+}
+
+// attemptNow solves one product with the first candidate with room. If ctx ends first it
+// returns gone, and the product goes to the stock when ready.
+func (b *BucketHandler) attemptNow(ctx context.Context, key string, candidates []SolverInterface[any], params Params) (SolverInterface[any], attemptResult, bool) {
 	solver, member := b.startNow(key, candidates)
 	b.probeOf(key, solver.GetName()).used()
 
-	ctx, cancel := context.WithTimeout(context.Background(), seconds(b.TimeoutSolve(solver)))
+	solveCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), seconds(b.TimeoutSolve(solver)))
 	done := make(chan attemptResult, 1)
 	go func() {
 		defer cancel()
 		defer b.finishNow(key, solver.GetName(), member)
-		prod, info := b.solve(ctx, key, solver, params)
+		prod, info := b.solve(solveCtx, key, solver, params)
 		done <- attemptResult{prod, info}
 	}()
 
-	timer := time.NewTimer(time.Until(deadline))
-	defer timer.Stop()
 	select {
 	case r := <-done:
 		return solver, r, false
-	case <-timer.C:
+	case <-ctx.Done():
 		go func() {
 			if r := <-done; r.info.err == nil {
 				b.savePool(context.Background(), key, r.prod)
@@ -153,6 +171,9 @@ func (b *BucketHandler) solve(ctx context.Context, key string, solver SolverInte
 	prod, info := NewProductBySolve(ctx, key, solver, params)
 	if info.err == nil || info.solverFault() { // a failure that is not the solver's must not trip its metrics
 		b.recordGeneration(key, solver.GetName(), time.Since(start), info.err != nil)
+	}
+	if info.kind() == external.KindTargetLimit {
+		b.recordThrottle(key)
 	}
 	solver.SubInflights()
 
