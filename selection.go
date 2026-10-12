@@ -4,6 +4,7 @@ import (
 	"math"
 	"math/rand/v2"
 	"slices"
+	"sync/atomic"
 	"time"
 )
 
@@ -141,4 +142,64 @@ func boundedShares(scores []float64, lo, hi float64) []float64 {
 	}
 	fill(high)
 	return shares
+}
+
+const (
+	probeEvery    = 30 * time.Second // a sick solver gets a probe at most this often
+	probeRequests = 10               // and only after this many requests solved now
+)
+
+// probeState tracks when a solver last got an attempt solved now.
+type probeState struct {
+	last  atomic.Int64 // unix ms
+	since atomic.Int64 // requests solved now since then
+}
+
+func (p *probeState) used() {
+	p.last.Store(time.Now().UnixMilli())
+	p.since.Store(0)
+}
+
+func (p *probeState) due() bool {
+	return time.Since(time.UnixMilli(p.last.Load())) >= probeEvery && p.since.Load() >= probeRequests
+}
+
+func (b *BucketHandler) probeOf(key, solver string) *probeState {
+	p, _ := b.probes.LoadOrStore(key+"/"+solver, &probeState{})
+	return p.(*probeState)
+}
+
+// firstCandidates returns the solvers for a first attempt: a sick one due for a probe, then the
+// healthy ones in order. With none healthy, the whole order.
+func (b *BucketHandler) firstCandidates(key string, order []SolverInterface[any]) []SolverInterface[any] {
+	var healthy []SolverInterface[any]
+	var probe SolverInterface[any]
+	for _, s := range order {
+		p := b.probeOf(key, s.GetName())
+		p.since.Add(1)
+		if !b.isSick(key, s) {
+			healthy = append(healthy, s)
+		} else if probe == nil && p.due() {
+			probe = s
+		}
+	}
+	if len(healthy) == 0 {
+		return order
+	}
+	if probe != nil {
+		return append([]SolverInterface[any]{probe}, healthy...)
+	}
+	return healthy
+}
+
+// retryCandidates returns the healthy solvers after prev in order, prev last. Empty when none is healthy.
+func (b *BucketHandler) retryCandidates(key string, order []SolverInterface[any], prev SolverInterface[any]) []SolverInterface[any] {
+	i := slices.Index(order, prev)
+	var out []SolverInterface[any]
+	for k := 1; k <= len(order); k++ {
+		if s := order[(i+k)%len(order)]; !b.isSick(key, s) {
+			out = append(out, s)
+		}
+	}
+	return out
 }

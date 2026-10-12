@@ -35,3 +35,4 @@ go.work.sum
 
 # Local environment (copy from the .example files)
 docker-compose.yml
+docs

@@ -47,6 +47,10 @@ func newStockEnv(t *testing.T, solver SolverInterface[any]) *stockEnv {
 	}))
 	t.Cleanup(proxySrv.Close)
 	smSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost { // estoque vazio
+			http.NotFound(w, r)
+			return
+		}
 		var p Product[any]
 		body, _ := io.ReadAll(r.Body)
 		json.Unmarshal(body, &p)
@@ -190,14 +194,8 @@ func TestStockOne_CancelamentoDoPaiChegaAoSolve(t *testing.T) {
 	}
 }
 
-func TestGetProduct_PrazoDoClienteLimitaODoSolver(t *testing.T) {
-	for _, tc := range []struct {
-		client   float64
-		min, max time.Duration
-	}{
-		{0.5, 0, 500 * time.Millisecond},                                          // cliente com pressa
-		{120, (maxSolveTimeout - 1) * time.Second, maxSolveTimeout * time.Second}, // não estende o do solver
-	} {
+func TestGetProduct_PrazoDoSolveEODoSolver(t *testing.T) {
+	for _, client := range []float64{0.5, 120} {
 		var deadline time.Duration
 		solver := &funcSolver{BaseSolver: BaseSolver{name: keyA, key: keyA}}
 		solver.fn = func(ctx context.Context, _ Params) (any, Info) {
@@ -207,11 +205,39 @@ func TestGetProduct_PrazoDoClienteLimitaODoSolver(t *testing.T) {
 		}
 		b := newBuckets(keyA, solver)
 
-		if _, err := b.GetProduct(Request{Key: keyA, Timeout: &tc.client}); err != nil {
+		if _, err := b.GetProduct(Request{Key: keyA, Timeout: &client}); err != nil {
 			t.Fatalf("erro inesperado: %v", err)
 		}
-		if deadline <= tc.min || deadline > tc.max {
-			t.Errorf("cliente %vs: prazo = %v, quer em (%v, %v]", tc.client, deadline, tc.min, tc.max)
+		if deadline <= (maxSolveTimeout-1)*time.Second || deadline > maxSolveTimeout*time.Second {
+			t.Errorf("cliente %vs: prazo do solve = %v, quer ~%ds", client, deadline, maxSolveTimeout)
 		}
+	}
+}
+
+func TestGetProduct_OrcamentoEsgotadoVaiParaOEstoque(t *testing.T) {
+	solver := &funcSolver{BaseSolver: BaseSolver{name: keyA, key: keyA}}
+	solver.fn = func(context.Context, Params) (any, Info) {
+		time.Sleep(300 * time.Millisecond)
+		return "tarde", Info{}
+	}
+	env := newStockEnv(t, solver)
+	env.b.proxy, env.b.redis = nil, nil // sem as esperas do Redis inacessível
+
+	budget := 0.05
+	start := time.Now()
+	_, err := env.b.GetProduct(Request{Key: keyA, Timeout: &budget})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("err = %v, quer prazo esgotado", err)
+	}
+	if took := time.Since(start); took > 250*time.Millisecond {
+		t.Errorf("GetProduct levou %v, quer voltar no fim do orçamento", took)
+	}
+	select {
+	case p := <-env.saved:
+		if p.Token != "tarde" {
+			t.Errorf("produto salvo = %+v, quer o da tentativa em andamento", p)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("o produto da tentativa em andamento não foi para o estoque")
 	}
 }

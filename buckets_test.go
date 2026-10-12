@@ -255,3 +255,90 @@ func TestAddGeneration_CorteEntraSoNaLatencia(t *testing.T) {
 		t.Errorf("w = %v, média = %v; quer 2, 4 (o corte entra na latência)", c.w, c.meanElapsedGenSucess)
 	}
 }
+
+// --- nova tentativa e solver doente ---
+
+// newPair monta uma chave com os solvers A e B, nessa ordem (peso 0: a ordem é fixa).
+func newPair(a, b *fakeSolver) *BucketHandler {
+	return &BucketHandler{
+		solvers: map[string][]SolverInterface[any]{keyA: {a, b}},
+		stats:   map[string]*KeyStats{keyA: {}},
+	}
+}
+
+func TestGetProduct_NovaTentativaNoProximoSolver(t *testing.T) {
+	a := &fakeSolver{key: "a", err: errors.New("falha"), code: 500}
+	b := &fakeSolver{key: "b", token: "B"}
+
+	got, err := newPair(a, b).GetProduct(Request{Key: keyA})
+	if err != nil || got.Token != "B" {
+		t.Fatalf("got = %v, err = %v; quer o produto de B", got.Token, err)
+	}
+	if a.calls != 1 || b.calls != 1 {
+		t.Errorf("calls A = %d, B = %d; quer 1, 1", a.calls, b.calls)
+	}
+}
+
+func TestGetProduct_TresTentativas(t *testing.T) {
+	solver := &fakeSolver{key: keyA, err: errors.New("falha"), code: 500}
+
+	if _, err := newBuckets(keyA, solver).GetProduct(Request{Key: keyA}); err == nil {
+		t.Fatal("quer erro")
+	}
+	if solver.calls != solveTries {
+		t.Errorf("calls = %d, quer %d", solver.calls, solveTries)
+	}
+}
+
+func TestGetProduct_ErroDeProxyNaoRepete(t *testing.T) {
+	solver := &fakeSolver{key: keyA, err: errors.New("407"), code: 407}
+
+	newBuckets(keyA, solver).GetProduct(Request{Key: keyA})
+	if solver.calls != 1 {
+		t.Errorf("calls = %d, quer 1: a proxy do cliente falharia de novo", solver.calls)
+	}
+}
+
+func TestGetProduct_PulaSolverDoente(t *testing.T) {
+	a := &fakeSolver{key: "a", token: "A"}
+	b := &fakeSolver{key: "b", token: "B"}
+	h := newPair(a, b)
+	h.states.Store(keyA, []solverState{{sick: true}, {}})
+
+	for range probeRequests - 1 {
+		if got, _ := h.GetProduct(Request{Key: keyA}); got.Token != "B" {
+			t.Fatalf("Token = %v, quer B: A está doente", got.Token)
+		}
+	}
+	// Na décima requisição A recebe a sonda.
+	if got, _ := h.GetProduct(Request{Key: keyA}); got.Token != "A" {
+		t.Errorf("Token = %v, quer A (sonda)", got.Token)
+	}
+	if a.calls != 1 || b.calls != probeRequests-1 {
+		t.Errorf("calls A = %d, B = %d; quer 1, %d", a.calls, b.calls, probeRequests-1)
+	}
+}
+
+func TestGetProduct_NovaTentativaSoEmSolverSaudavel(t *testing.T) {
+	a := &fakeSolver{key: "a", err: errors.New("falha"), code: 500}
+	b := &fakeSolver{key: "b", token: "B"}
+	h := newPair(a, b)
+	h.states.Store(keyA, []solverState{{}, {sick: true}})
+
+	h.GetProduct(Request{Key: keyA})
+	if a.calls != solveTries || b.calls != 0 {
+		t.Errorf("calls A = %d, B = %d; quer %d, 0: só A está saudável", a.calls, b.calls, solveTries)
+	}
+}
+
+func TestGetProduct_TodosDoentesSemNovaTentativa(t *testing.T) {
+	a := &fakeSolver{key: "a", err: errors.New("falha"), code: 500}
+	b := &fakeSolver{key: "b", token: "B"}
+	h := newPair(a, b)
+	h.states.Store(keyA, []solverState{{sick: true}, {sick: true}})
+
+	h.GetProduct(Request{Key: keyA})
+	if a.calls != 1 || b.calls != 0 {
+		t.Errorf("calls A = %d, B = %d; quer 1, 0", a.calls, b.calls)
+	}
+}

@@ -12,14 +12,17 @@ Roda na AWS em várias tasks atrás de um balanceador, então o estado compartil
 - **Labels (`Request.Labels`)**: atributos livres (`client`, `pool`, `region`...) que outras partes, como a proxy, podem usar.
 - **Solver**: gera um produto para uma chave. Uma chave pode ter vários solvers, cada um com um peso (0 desativa).
 - **Produto**: o que é entregue, ou seja, Id, chave, Solver que gerou, horário, tempo de geração, o valor e os `Params` usados para gerá-lo. Um produto do estoque traz a proxy com que foi gerado, e o cliente deve usar essa proxy.
-- **Prazo (`Request.Timeout`)**: opcional, em segundos. Limita o prazo do solve (ver [Prazo e erros do `Solve`](#prazo-e-erros-do-solve)).
+- **Prazo (`Request.Timeout`)**: opcional, em segundos. Orçamento total do `GetProduct`; 30s quando ausente.
 
 ## Fluxo do `GetProduct(key)`
 
 1. Valida a chave.
 2. Incrementa o contador global da chave no Redis (`{chave}:requests`). Se falhar, o incremento é guardado e somado na próxima requisição.
 3. Busca o produto no estoque externo (`SessionManager.Get`).
-4. Se não conseguir, escolhe um Solver e resolve na hora.
+4. Se não conseguir, resolve na hora em até 3 tentativas, dentro do orçamento (`Request.Timeout`, ou 30s):
+   - a primeira vai para um solver saudável, na ordem da [escolha](#escolha-do-solver). Um solver doente só recebe uma sonda a cada 30s e 10 requisições;
+   - se a tentativa falhar, a próxima vai para o próximo solver saudável. Sem solver saudável, ou com erro de proxy, não há nova tentativa;
+   - se o orçamento acabar, o cliente recebe erro e a tentativa em andamento segue: o produto vai para o estoque.
 
 ### Escolha do Solver
 
@@ -32,7 +35,7 @@ Definida por `SolverConfig.adaptiveChoice`:
 
 `Solve(ctx, params)` devolve o produto e um `Info` com o erro e o código HTTP da falha (0 quando não há código).
 
-**Prazo:** o `ctx` do solve vence em `média + 4 × desvio` da latência de sucesso do solver, limitado entre 2s e 30s. Média e desvio são ponderados com o mesmo decaimento das outras métricas (meia-vida de 30 min). Sem amostras, o prazo é 30s. No `GetProduct`, o `Request.Timeout` do cliente reduz esse prazo, mas não o estende. No estoque, o prazo deriva do `ctx` do loop, então desligar o loop cancela os solves em andamento.
+**Prazo:** o `ctx` do solve vence em `média + 4 × desvio` da latência de sucesso do solver, limitado entre 2s e 30s. Média e desvio são ponderados com meia-vida de 5 min, e um solve cortado entra como amostra com o valor do prazo. Sem amostras, o prazo é 30s. O `Request.Timeout` do cliente não muda o prazo de cada tentativa: é o orçamento do `GetProduct`. No estoque, o prazo deriva do `ctx` do loop, então desligar o loop cancela os solves em andamento.
 
 **Erros:** o código em `Info` decide quem leva a culpa (`external/httperrors.go`):
 
@@ -104,7 +107,10 @@ go test -race ./...
 ## Pendências conhecidas
 
 - `main()` vazio: falta iniciar o `BucketHandler`, o `SessionManager` e o servidor `tcpapi`.
-- **Melhoria — cliente que desiste:** o `GetProduct` não recebe `context`, então o prazo do cliente só vale pelo `Request.Timeout`; se a conexão cair, o solve segue até o fim e o produto é descartado. Passar o `ctx` da requisição e, se o cliente desistir, mandar o produto em andamento para o estoque.
+- **Melhoria — cliente que desiste:** o `GetProduct` não recebe `context`, então só o fim do orçamento manda a tentativa em andamento para o estoque; se a conexão cair antes, o produto é descartado. Passar o `ctx` da requisição.
+- **A pensar:** o guard de solver doente só vale nas chaves com estoque configurado, porque o `sick` vem do tick do estoque.
+- **A pensar:** recuperação lenta de solver doente com pouca demanda direta (abaixo de ~20 rpm): a sonda vem a cada 10 requisições. Avaliar voltar a saudável após 3 sondas seguidas com sucesso.
+- **A pensar:** com a meia-vida de 5 min, o timeout fica apertado em demanda muito baixa (~5% de cortes a 0,5 rpm). Avaliar timeout máximo enquanto `w < 20` ou correção de Bessel no desvio.
 - **Melhoria — classificar o resto dos erros do `Solve`:** hoje só se separa erro de proxy, erro do solver e erro que não é do solver (ver [Prazo e erros do `Solve`](#prazo-e-erros-do-solve)). Faltam: temporário (tenta outro solver), limite do destino (reduz o ritmo da chave inteira) e parâmetro inválido do cliente (não repete nem pune). Os solvers costumam ter códigos próprios, fora do padrão HTTP; avaliar se o mapa de `external/httperrors.go` basta ou se o `Info` deve trazer a classe do erro explícita.
 - **A pensar:** erro sem código (`errCode` 0) nunca pune o solver. Um solver que falha sempre sem código não perde tráfego nem fica doente.
 - **Melhoria — pontuação de proxy:** a proxy do estoque é trocada na primeira falha de proxy. Manter taxa de sucesso por proxy e trocar só quando cair, e lembrar quais proxies funcionam melhor com cada solver.
@@ -113,7 +119,6 @@ go test -race ./...
 - As métricas da escolha adaptativa (`SolverStats`) ainda são por task, não globais. Próxima etapa depois do estoque distribuído: levar para o Redis em `{chave}:solver:<nome>`.
 - **A pensar:** `redisconn` usa `redis.Client` (nó único). Com ElastiCache em modo cluster, trocar por `redis.UniversalClient`/`ClusterClient`, que segue `MOVED`/`ASK`.
 - **A pensar:** requisição duplicada. Se o solver passar do seu p95, dispara um segundo em paralelo e fica com o primeiro que terminar; o outro vai para o estoque. Avaliar se o ganho no p99 compensa o custo (cerca de 5% de gerações a mais) e o que fazer com o produto extra em chaves sem estoque.
-- **A pensar:** nova tentativa no `GetProduct` dentro de um orçamento de tempo. Hoje tenta um solver só e devolve erro se falhar. A ideia é tentar o próximo solver da lista sem passar do orçamento total (melhor devolver erro do que demorar): em sequência com corte por tentativa, ou em paralelo com atraso (dispara o próximo quando o atual falha ou passa do p95 e fica com o primeiro que terminar). Antes, medir o desperdício: o produto que perde a corrida pode ir para o estoque, mas só é consumido se houver demanda; em chaves com pouca demanda ele vence no pool sem uso.
 - **A pensar:** limite de concorrência fixo (solver comprado, API com limite em contrato).
   - A geração na hora passa do limite: `startNow` usa o primeiro solver mesmo com todos cheios, e também quando o Redis falha. Quando não há vaga, avaliar esperar dentro do orçamento de tempo ou devolver erro.
   - O limite é contado por chave (`busyKey(key, solver)`): uma mesma conta usada em várias chaves passa do contrato. Avaliar contar pelo recurso real, compartilhado entre as chaves.

@@ -30,6 +30,7 @@ type BucketHandler struct {
 
 	states  sync.Map // key -> []solverState, refreshed by every stock tick
 	proxies sync.Map // key -> string, proxy the stock of the key uses until it fails
+	probes  sync.Map // key/solver -> *probeState
 }
 
 func NewBucketHandler() *BucketHandler {
@@ -48,8 +49,14 @@ func NewBucketHandler() *BucketHandler {
 }
 
 // TODO: Criar uma struct de erro com informações de métricas importantes para avaliação.
-// TODO: Cliente que abrir requisição e desistir do produto, o produto deve ser salvo na fila e não descartado.
+// GetProduct returns a product from the stock or solves one now, in up to solveTries attempts.
 func (b *BucketHandler) GetProduct(req Request) (Product[any], error) {
+	budget := float64(maxSolveTimeout)
+	if req.Timeout != nil && *req.Timeout > 0 {
+		budget = *req.Timeout
+	}
+	deadline := time.Now().Add(seconds(budget))
+
 	key := req.Key
 	if _, ok := b.stats[key]; !ok {
 		return Product[any]{}, fmt.Errorf("nenhuma chave registrada: %s", key)
@@ -67,26 +74,69 @@ func (b *BucketHandler) GetProduct(req Request) (Product[any], error) {
 	if err != nil {
 		return Product[any]{}, err
 	}
-	solver, member := b.startNow(key, order)
-	defer b.finishNow(key, solver.GetName(), member)
 
-	// The solver's timeout, limited by the client's (in seconds).
-	t := b.TimeoutSolve(solver)
-	if req.Timeout != nil && *req.Timeout > 0 {
-		t = min(t, *req.Timeout)
+	candidates := b.firstCandidates(key, order)
+	var lastErr error
+	for range solveTries {
+		solver, r, late := b.attemptNow(key, candidates, req.Params, deadline)
+		if late {
+			return Product[any]{}, fmt.Errorf("orçamento de %gs esgotado: %w", budget, context.DeadlineExceeded)
+		}
+		if r.info.err == nil {
+			return r.prod, nil
+		}
+		lastErr = r.info.err
+		// The client's proxy would fail on another solver too.
+		if external.ItsProxyError(r.info.errCode) || !time.Now().Before(deadline) {
+			break
+		}
+		if candidates = b.retryCandidates(key, order, solver); len(candidates) == 0 {
+			break
+		}
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), seconds(t))
-	defer cancel()
-
-	prod, info := b.solve(ctx, key, solver, req.Params)
-
-	return prod, info.err
+	return Product[any]{}, lastErr
 }
 
 const (
-	maxSolveTimeout = 30 // seconds, also the timeout while the solver's latency is not measured
+	maxSolveTimeout = 30 // seconds, also the default budget of GetProduct
 	minSolveTimeout = 2  // seconds
+	solveTries      = 3  // attempts of a generation solved now
 )
+
+type attemptResult struct {
+	prod Product[any]
+	info Info
+}
+
+// attemptNow solves one product with the first candidate with room. Past deadline it returns
+// late, and the product goes to the stock.
+func (b *BucketHandler) attemptNow(key string, candidates []SolverInterface[any], params Params, deadline time.Time) (SolverInterface[any], attemptResult, bool) {
+	solver, member := b.startNow(key, candidates)
+	b.probeOf(key, solver.GetName()).used()
+
+	ctx, cancel := context.WithTimeout(context.Background(), seconds(b.TimeoutSolve(solver)))
+	done := make(chan attemptResult, 1)
+	go func() {
+		defer cancel()
+		defer b.finishNow(key, solver.GetName(), member)
+		prod, info := b.solve(ctx, key, solver, params)
+		done <- attemptResult{prod, info}
+	}()
+
+	timer := time.NewTimer(time.Until(deadline))
+	defer timer.Stop()
+	select {
+	case r := <-done:
+		return solver, r, false
+	case <-timer.C:
+		go func() {
+			if r := <-done; r.info.err == nil {
+				b.savePool(context.Background(), key, r.prod)
+			}
+		}()
+		return solver, attemptResult{}, true
+	}
+}
 
 // TimeoutSolve returns the timeout of one solve by solver, in seconds.
 func (b *BucketHandler) TimeoutSolve(solver SolverInterface[any]) float64 {

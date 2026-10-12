@@ -567,11 +567,21 @@ func (b *BucketHandler) stockOne(ctx context.Context, key string, solver SolverI
 		return false
 	}
 
+	return b.savePool(ctx, key, prod)
+}
+
+// savePool saves prod in the stock and counts it as made. It reports success.
+func (b *BucketHandler) savePool(ctx context.Context, key string, prod Product[any]) bool {
+	if b.sm == nil {
+		return false
+	}
 	if _, err := b.sm.Save(ctx, key, prod); err != nil {
 		log.Warn("falha ao salvar produto no estoque", "key", key, "err", err)
 		return false
 	}
-	b.redis.HIncrBy(ctx, redisKey(key, "gen"), "made", 1)
+	if b.redis != nil {
+		b.redis.HIncrBy(ctx, redisKey(key, "gen"), "made", 1)
+	}
 	return true
 }
 
