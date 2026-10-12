@@ -13,16 +13,17 @@ Roda na AWS em várias tasks atrás de um balanceador, então o estado compartil
 - **Solver**: gera um produto para uma chave. Uma chave pode ter vários solvers, cada um com um peso (0 desativa).
 - **Produto**: o que é entregue, ou seja, Id, chave, Solver que gerou, horário, tempo de geração, o valor e os `Params` usados para gerá-lo. Um produto do estoque traz a proxy com que foi gerado, e o cliente deve usar essa proxy.
 - **Prazo (`Request.Timeout`)**: opcional, em segundos. Orçamento total do `GetProduct`; 30s quando ausente.
+- **Contexto do cliente**: o `ctx` passado ao `GetProduct`. Se o cliente cancelar, ou o prazo dele vencer antes do orçamento, o `GetProduct` para na hora e devolve o erro do próprio `ctx`.
 
-## Fluxo do `GetProduct(key)`
+## Fluxo do `GetProduct(ctx, req)`
 
 1. Valida a chave.
 2. Incrementa o contador global da chave no Redis (`{chave}:requests`). Se falhar, o incremento é guardado e somado na próxima requisição.
-3. Busca o produto no estoque externo (`SessionManager.Get`).
-4. Se não conseguir, resolve na hora em até 3 tentativas, dentro do orçamento (`Request.Timeout`, ou 30s):
+3. Busca o produto no estoque externo (`SessionManager.Get`). Se o cliente já tiver saído quando o produto chegar, ele é devolvido ao estoque.
+4. Se não conseguir, resolve na hora em até 3 tentativas, dentro do orçamento (`Request.Timeout`, ou 30s) e enquanto o cliente esperar:
    - a primeira vai para um solver saudável, na ordem da [escolha](#escolha-do-solver). Um solver doente só recebe uma sonda a cada 30s e 10 requisições;
-   - se a tentativa falhar, a próxima vai para o próximo solver saudável. Sem solver saudável, ou com erro de proxy, não há nova tentativa;
-   - se o orçamento acabar, o cliente recebe erro e a tentativa em andamento segue: o produto vai para o estoque.
+   - se a tentativa falhar, a próxima vai para o próximo solver saudável, só quando a [classe do erro](#prazo-e-erros-do-solve) permite. Sem solver saudável não há nova tentativa;
+   - se o orçamento acabar ou o cliente cancelar, ele recebe erro e a tentativa em andamento segue: o produto vai para o estoque.
 
 ### Escolha do Solver
 
@@ -33,17 +34,23 @@ Definida por `SolverConfig.adaptiveChoice`:
 
 ### Prazo e erros do `Solve`
 
-`Solve(ctx, params)` devolve o produto e um `Info` com o erro e o código HTTP da falha (0 quando não há código).
+`Solve(ctx, params)` devolve o produto e um `Info` com o erro, o código HTTP da falha (0 quando não há código) e, opcionalmente, a classe do erro (`errKind`).
 
-**Prazo:** o `ctx` do solve vence em `média + 4 × desvio` da latência de sucesso do solver, limitado entre 2s e 30s. Média e desvio são ponderados com meia-vida de 5 min, e um solve cortado entra como amostra com o valor do prazo. Sem amostras, o prazo é 30s. O `Request.Timeout` do cliente não muda o prazo de cada tentativa: é o orçamento do `GetProduct`. No estoque, o prazo deriva do `ctx` do loop, então desligar o loop cancela os solves em andamento.
+**Prazo:** o `ctx` do solve vence em `média + 4 × desvio` da latência de sucesso do solver, limitado entre 2s e 30s. Média e desvio são ponderados com meia-vida de 5 min, e um solve cortado entra como amostra com o valor do prazo. Sem amostras, o prazo é 30s. O `Request.Timeout` do cliente não muda o prazo de cada tentativa: é o orçamento do `GetProduct`. O cancelamento do cliente também não chega ao solve, que termina e manda o produto para o estoque. No estoque, o prazo deriva do `ctx` do loop, então desligar o loop cancela os solves em andamento.
 
-**Erros:** o código em `Info` decide quem leva a culpa (`external/httperrors.go`):
+**Erros:** a classe do erro (`external.ErrKind`) decide a reação. Um solver com códigos próprios, fora do padrão HTTP, preenche `errKind`. Sem ele, a classe vem do código HTTP (`external.KindOf`, em `external/httperrors.go`):
 
-| Código | Culpa | Efeito |
-|---|---|---|
-| 407 | proxy | a proxy do estoque é descartada e reportada como ruim; não conta para o solver |
-| 0, 429, 502, 503, 504 | nem do solver nem da proxy | não conta para o solver; a proxy é reportada como boa |
-| outros | solver | conta como falha nas métricas locais e no Redis (saúde e disjuntor) |
+| Classe | Códigos | Pune o solver | Nova tentativa | Outros efeitos |
+|---|---|---|---|---|
+| solver | os não listados | sim | sim | conta como falha nas métricas locais e no Redis (saúde e disjuntor) |
+| temporário | 0, 502, 503, 504 | não | sim | — |
+| proxy | 407 | não | não | a proxy do estoque é descartada e reportada como ruim |
+| limite do destino | 429 | não | não | conta em `{chave}:gen` (`throttled`) e freia o estoque da chave (abaixo) |
+| cliente | 400, 422 | não | não | — |
+
+Fora do erro de proxy, a proxy do estoque é reportada como boa.
+
+**Freio por limite do destino:** o líder do estoque compara o contador `throttled` com o valor guardado no freio (`{chave}:brake`). Se mudou, corta o limite do estoque para 25% do teto e abre o cooldown da config, como o disjuntor. O limite nunca fica abaixo da taxa de requisições, e o freio não vale para a geração na hora.
 
 **Report da proxy (estoque):** toda geração reporta a proxy usada, em segundo plano para não segurar o loop: falha só com erro de proxy, sucesso em qualquer outro caso.
 
@@ -56,7 +63,7 @@ Definida por `SolverConfig.adaptiveChoice`:
 | Pacote | O que faz |
 |---|---|
 | `.` (main) | `BucketHandler`, seleção de solvers, estatísticas, produto |
-| `external` | Cliente HTTP/JSON para sistemas externos (`External`), `SessionManager` e lista de erros comuns |
+| `external` | Cliente HTTP/JSON para sistemas externos (`External`), `SessionManager`, `Logs`, erros comuns e classe do erro (`ErrKind`) |
 | `tcpapi` | Servidor TCP genérico com confirmação de entrega |
 | `redisconn` | Conexão com o Redis |
 
@@ -72,6 +79,17 @@ Definida por `SolverConfig.adaptiveChoice`:
   "beta|cli": "/sessoes/beta"
 }
 ```
+
+- `Logs`: envia métricas a um sistema externo de logs, que também responde consultas (`Query`, POST em `logs/query`). `Add(log)` só enfileira (até 10.000; com a fila cheia o log é descartado e contado) e `Run(ctx)` envia em lotes de até 500 por POST em `logs`, a cada 5s. Todo log leva o `Pod` que o enviou (`PodName()`: `POD_NAME` ou o hostname), para separar as métricas por pod. Tipos (`Kind`):
+
+| Kind | O que traz |
+|---|---|
+| `request` | um `GetProduct`: origem (estoque ou na hora), resultado, latência, tentativas |
+| `generation` | um `Solve`: solver, origem, resultado (classe do erro), latência, carga e limite do solver |
+| `usage` | um `ReportUsage`: solver, origem, se funcionou, idade do produto |
+| `stock` | uma janela do estoque de uma chave: taxa, alvo, pool, vencidos, limite do freio, desperdício, disjuntor, 429 |
+| `proxy` | proxy descartada ou reportada, identificada por `ProxyID` (hash curto, nunca a URL com credenciais) |
+| `pod` | saúde do processo, enviada pelo `Run` a cada 5s: goroutines, heap, logs descartados |
 
 ### `tcpapi`
 
@@ -106,13 +124,15 @@ go test -race ./...
 
 ## Pendências conhecidas
 
-- `main()` vazio: falta iniciar o `BucketHandler`, o `SessionManager` e o servidor `tcpapi`.
-- **Melhoria — cliente que desiste:** o `GetProduct` não recebe `context`, então só o fim do orçamento manda a tentativa em andamento para o estoque; se a conexão cair antes, o produto é descartado. Passar o `ctx` da requisição.
+- `main()` vazio: falta iniciar o `BucketHandler`, o `SessionManager`, o `Logs.Run` e o servidor `tcpapi`.
+- `Logs` ainda não é chamado: falta enviar os logs em `GetProduct`, `solve`, `ReportUsage`, `stockTick` e na troca de proxy. Para a idade do produto no `usage`, o `ReportUsage` precisa receber o produto. Os paths `logs` e `logs/query` são provisórios até definir o sistema de logs.
 - **A pensar:** o guard de solver doente só vale nas chaves com estoque configurado, porque o `sick` vem do tick do estoque.
 - **A pensar:** recuperação lenta de solver doente com pouca demanda direta (abaixo de ~20 rpm): a sonda vem a cada 10 requisições. Avaliar voltar a saudável após 3 sondas seguidas com sucesso.
 - **A pensar:** com a meia-vida de 5 min, o timeout fica apertado em demanda muito baixa (~5% de cortes a 0,5 rpm). Avaliar timeout máximo enquanto `w < 20` ou correção de Bessel no desvio.
-- **Melhoria — classificar o resto dos erros do `Solve`:** hoje só se separa erro de proxy, erro do solver e erro que não é do solver (ver [Prazo e erros do `Solve`](#prazo-e-erros-do-solve)). Faltam: temporário (tenta outro solver), limite do destino (reduz o ritmo da chave inteira) e parâmetro inválido do cliente (não repete nem pune). Os solvers costumam ter códigos próprios, fora do padrão HTTP; avaliar se o mapa de `external/httperrors.go` basta ou se o `Info` deve trazer a classe do erro explícita.
-- **A pensar:** erro sem código (`errCode` 0) nunca pune o solver. Um solver que falha sempre sem código não perde tráfego nem fica doente.
+- **A pensar:** erro sem código e sem classe (`errCode` 0) é temporário e nunca pune o solver. Um solver que falha sempre assim não perde tráfego nem fica doente; ele deve preencher `errKind`.
+- **A pensar:** o 403 conta como culpa do solver, mas pode ser o destino bloqueando. Cada solver pode reclassificar com `errKind`.
+- **A pensar:** erro de rede da proxy (conexão recusada no dial) chega como código 0, ou seja, temporário: a proxy não é descartada. Avaliar detectar pelo tipo do erro ou deixar com o solver.
+- **A pensar:** o freio do 429 só vale para o estoque e nunca desce abaixo da taxa de requisições; a geração na hora continua batendo no destino.
 - **Melhoria — pontuação de proxy:** a proxy do estoque é trocada na primeira falha de proxy. Manter taxa de sucesso por proxy e trocar só quando cair, e lembrar quais proxies funcionam melhor com cada solver.
 - **A pensar — segurança da proxy no estoque:** o produto guarda os `Params` com a URL inteira da proxy (`http://user:pass@host:porta`), em texto puro no estoque externo. Avaliar guardar só uma referência à proxy ou cifrar as credenciais.
 - Qualquer falha do estoque externo cai em "resolver na hora"; ainda não se distingue "sem estoque" de "sistema fora".
