@@ -240,3 +240,18 @@ func TestTimeoutGen(t *testing.T) {
 		t.Errorf("TimeoutGen = %v, quer 8", got)
 	}
 }
+
+func TestAddGeneration_CorteEntraSoNaLatencia(t *testing.T) {
+	var s SolverStats
+	now := time.Now()
+	s.AddGeneration(now, 3*time.Second, Info{})
+	s.AddGeneration(now, 5*time.Second, Info{err: context.DeadlineExceeded})
+
+	c := s.Snapshot(now)
+	if c.genSuccess != 1 || c.genFailure != 0 {
+		t.Errorf("genSuccess = %v, genFailure = %v; quer 1, 0", c.genSuccess, c.genFailure)
+	}
+	if c.w != 2 || c.meanElapsedGenSucess != 4 {
+		t.Errorf("w = %v, média = %v; quer 2, 4 (o corte entra na latência)", c.w, c.meanElapsedGenSucess)
+	}
+}

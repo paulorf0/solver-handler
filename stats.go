@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"math"
 	"strconv"
 	"sync"
@@ -12,8 +13,9 @@ import (
 )
 
 const (
-	halfLife   = 30 * time.Minute // Solver samples lose half their weight every halfLife
-	minDecayed = 0.01             // decayed counters below this are zeroed
+	halfLife        = 30 * time.Minute // Solver samples lose half their weight every halfLife
+	latencyHalfLife = 5 * time.Minute  // same for the latency samples of the timeout, which must follow a slowdown fast
+	minDecayed      = 0.01             // decayed counters below this are zeroed
 )
 
 // TODO: This project will run on AWS with more than one task behind a load balancer.
@@ -43,9 +45,10 @@ func (s *SolverStats) decay(now time.Time) {
 		return
 	}
 	if !s.updatedAt.IsZero() {
-		f := math.Pow(0.5, now.Sub(s.updatedAt).Seconds()/halfLife.Seconds()) // (1/2)^(delta_t / halfLife)
+		dt := now.Sub(s.updatedAt).Seconds()
+		f := math.Pow(0.5, dt/halfLife.Seconds()) // (1/2)^(delta_t / halfLife)
 		c := &s.counters
-		for _, v := range []*float64{&c.genSuccess, &c.genFailure, &c.usageSuccess, &c.usageFailure, &c.genElapsed, &c.w} {
+		for _, v := range []*float64{&c.genSuccess, &c.genFailure, &c.usageSuccess, &c.usageFailure, &c.genElapsed} {
 			if *v *= f; *v < minDecayed {
 				*v = 0
 			}
@@ -53,9 +56,11 @@ func (s *SolverStats) decay(now time.Time) {
 		if c.genSuccess == 0 {
 			c.genElapsed = 0
 		}
-		// m2 follows w: a small variance (seconds²) is not a decayed-away weight. The mean keeps
-		// its value, since scaling every weight alike does not move it.
-		if c.m2 *= f; c.w == 0 {
+		fl := math.Pow(0.5, dt/latencyHalfLife.Seconds())
+		if c.w *= fl; c.w < minDecayed {
+			c.w = 0
+		}
+		if c.m2 *= fl; c.w == 0 {
 			c.m2 = 0
 		}
 	}
@@ -72,12 +77,22 @@ func (s *SolverStats) AddGeneration(now time.Time, elapsed time.Duration, info I
 		if info.solverFault() {
 			s.counters.genFailure++
 		}
+		// A solve cut by its timeout took at least that long: left out, the timeout would only
+		// learn from the solves that fit in it and never rise when the solver slows down.
+		if errors.Is(info.err, context.DeadlineExceeded) {
+			s.addLatency(elapsed)
+		}
 		return
 	}
 
 	s.counters.genSuccess++
 	s.counters.genElapsed += elapsed.Seconds()
-	// Weighted Welford with weight 1 per sample; decay scales w and m2 alike.
+	s.addLatency(elapsed)
+}
+
+// addLatency adds one latency sample of the timeout, by weighted Welford with weight 1; decay
+// scales w and m2 alike. Caller must hold the lock.
+func (s *SolverStats) addLatency(elapsed time.Duration) {
 	x := elapsed.Seconds()
 	s.counters.w++
 	d := x - s.counters.meanElapsedGenSucess
@@ -97,13 +112,18 @@ func (s *SolverStats) deviation() float64 {
 //
 //	t = mean + 4 × deviation, clamped to [min, max]
 //
-// mean and deviation follow the decayed weights, not the samples' age. With no samples it
-// returns max.
+// mean and deviation weigh the samples by age (latencyHalfLife). A solve cut by the timeout
+// counts as a sample of the timeout's length. With no samples it returns max.
 func (s *SolverStats) TimeoutGen(max, min float64) float64 {
+	return s.timeoutGenAt(time.Now(), max, min)
+}
+
+// timeoutGenAt is TimeoutGen with the metrics decayed to now.
+func (s *SolverStats) timeoutGenAt(now time.Time, max, min float64) float64 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	s.decay(time.Now())
+	s.decay(now)
 	if s.counters.w == 0 {
 		return max
 	}
