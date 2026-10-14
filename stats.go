@@ -295,3 +295,32 @@ func (b *BucketHandler) finishNow(key string, solver, member string) {
 func clamp(val, max, min float64) float64 {
 	return math.Min(math.Max(val, min), max)
 }
+
+type ProxyStats struct {
+	proxy  string
+	sucess int
+	usage  int
+}
+
+// SucessRate returns the proxy usage success rate, on a scale of 0 to 1.
+func (p *ProxyStats) SucessRate() float64 {
+	if p.usage == 0 {
+		return 0
+	}
+	return float64(p.sucess) / float64(p.usage)
+}
+
+// Good tells whether the success rate reaches minRate.
+func (p *ProxyStats) Good(minRate float64) bool {
+	if minRate <= 0 {
+		return false
+	}
+
+	return p.SucessRate() >= minRate
+}
+
+func (p *ProxyStats) Reset() {
+	p.proxy = ""
+	p.usage = 0
+	p.sucess = 0
+}

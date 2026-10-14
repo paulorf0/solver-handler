@@ -551,8 +551,9 @@ func (b *BucketHandler) generate(key string, solver SolverInterface[any], member
 // stockOne solves one product for the stock with solver and saves it. It reports success.
 func (b *BucketHandler) stockOne(ctx context.Context, key string, solver SolverInterface[any]) bool {
 	var params Params
+	solverName := solver.GetName()
 	if b.proxy != nil {
-		proxy, err := b.stockProxy(ctx, key)
+		proxy, err := b.stockProxy(ctx, key, solverName)
 		if err != nil {
 			log.Warn("falha ao obter proxy para o estoque", "key", key, "err", err)
 			return false
@@ -566,9 +567,9 @@ func (b *BucketHandler) stockOne(ctx context.Context, key string, solver SolverI
 	// Only a proxy error counts against the proxy: any other outcome means it worked.
 	if params.Proxy != "" {
 		if info.kind() == external.KindProxy {
-			b.dropProxy(key, params.Proxy)
+			b.dropProxy(key, solverName, params.Proxy)
 		} else {
-			b.reportProxy(key, params.Proxy, true)
+			b.reportProxy(key, solverName, params.Proxy, true)
 		}
 	}
 	if info.err != nil {
@@ -595,10 +596,22 @@ func (b *BucketHandler) savePool(ctx context.Context, key string, prod Product[a
 }
 
 // stockProxy returns the proxy the stock of key uses, asking the provider for one if there is none.
-func (b *BucketHandler) stockProxy(ctx context.Context, key string) (string, error) {
-	if p, ok := b.proxies.Load(key); ok {
-		return p.(string), nil
+func (b *BucketHandler) stockProxy(ctx context.Context, key string, solverName string) (string, error) {
+	var pStat ProxyStats
+	b.proxiesMu.Lock()
+	if p, ok := b.proxies[key][solverName]; ok {
+		pStat = p
+		if pStat.Good(b.cfg().ProxyMinRate) {
+			pStat.usage++
+			b.proxies[key][solverName] = pStat
+			b.proxiesMu.Unlock()
+			return pStat.proxy, nil
+		}
+		pStat.Reset()
 	}
+	b.proxiesMu.Unlock()
+
+	// The lock is not held while asking the provider.
 	info, err := b.proxy.Get(ctx, key)
 	if err != nil {
 		return "", err
@@ -606,22 +619,49 @@ func (b *BucketHandler) stockProxy(ctx context.Context, key string) (string, err
 	if info.Proxy == "" {
 		return "", fmt.Errorf("provedor devolveu proxy vazia para a chave %s", key)
 	}
-	p, _ := b.proxies.LoadOrStore(key, info.Proxy)
-	return p.(string), nil
-}
+	pStat.proxy = info.Proxy
+	pStat.usage = 1
 
-// dropProxy discards the failed proxy of key so the next solve gets a new one, and reports it.
-// Only the first caller for that proxy reports, so concurrent failures report once.
-func (b *BucketHandler) dropProxy(key string, proxy string) {
-	if !b.proxies.CompareAndDelete(key, proxy) {
-		return
+	b.proxiesMu.Lock()
+	defer b.proxiesMu.Unlock()
+	if p, ok := b.proxies[key][solverName]; ok { // another caller stored one meanwhile
+		p.usage++
+		b.proxies[key][solverName] = p
+		return p.proxy, nil
 	}
-	b.reportProxy(key, proxy, false)
+	if b.proxies == nil {
+		b.proxies = make(map[string]map[string]ProxyStats)
+	}
+	if b.proxies[key] == nil {
+		b.proxies[key] = make(map[string]ProxyStats)
+	}
+	b.proxies[key][solverName] = pStat
+	return pStat.proxy, nil
 }
 
-// reportProxy tells the provider, in the background, whether proxy worked for key, so the
-// stock loop does not wait for it.
-func (b *BucketHandler) reportProxy(key string, proxy string, success bool) {
+// dropProxy reports the failed proxy of key and discards it if its success rate is not good.
+func (b *BucketHandler) dropProxy(key string, solverName string, proxy string) {
+	b.reportProxy(key, solverName, proxy, false)
+
+	b.proxiesMu.Lock()
+	defer b.proxiesMu.Unlock()
+	if old, ok := b.proxies[key][solverName]; ok && old.proxy == proxy && !old.Good(b.cfg().ProxyMinRate) {
+		delete(b.proxies[key], solverName)
+	}
+}
+
+// reportProxy counts a success of proxy and tells the provider, in the background, whether it
+// worked for key.
+func (b *BucketHandler) reportProxy(key string, solverName string, proxy string, success bool) {
+	if success {
+		b.proxiesMu.Lock()
+		if old, ok := b.proxies[key][solverName]; ok && old.proxy == proxy {
+			old.sucess++
+			b.proxies[key][solverName] = old
+		}
+		b.proxiesMu.Unlock()
+	}
+
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), proxyReportTimeout)
 		defer cancel()

@@ -27,7 +27,7 @@ Roda na AWS em várias tasks atrás de um balanceador, então o estado compartil
 
 ### Escolha do Solver
 
-Definida por `SolverConfig.adaptiveChoice`:
+Definida por `adaptiveChoice` na config do backoffice:
 
 - **Peso fixo**: sorteio proporcional ao peso (os pesos não precisam somar 100).
 - **Adaptativa**: usa as métricas de cada Solver (qualidade do produto, taxa de sucesso, velocidade e carga atual) multiplicadas pelo peso. Cada Solver fica entre 5% e 90% do tráfego. Sem métricas, segue os pesos.
@@ -44,7 +44,7 @@ Definida por `SolverConfig.adaptiveChoice`:
 |---|---|---|---|---|
 | solver | os não listados | sim | sim | conta como falha nas métricas locais e no Redis (saúde e disjuntor) |
 | temporário | 0, 502, 503, 504 | não | sim | — |
-| proxy | 407 | não | não | a proxy do estoque é descartada e reportada como ruim |
+| proxy | 407 | não | não | reportada como ruim; a proxy do estoque é descartada se a taxa de sucesso está abaixo de `proxyMinRate` |
 | limite do destino | 429 | não | não | conta em `{chave}:gen` (`throttled`) e freia o estoque da chave (abaixo) |
 | cliente | 400, 422 | não | não | — |
 
@@ -52,7 +52,7 @@ Fora do erro de proxy, a proxy do estoque é reportada como boa.
 
 **Freio por limite do destino:** o líder do estoque compara o contador `throttled` com o valor guardado no freio (`{chave}:brake`). Se mudou, corta o limite do estoque para 25% do teto e abre o cooldown da config, como o disjuntor. O limite nunca fica abaixo da taxa de requisições, e o freio não vale para a geração na hora.
 
-**Report da proxy (estoque):** toda geração reporta a proxy usada, em segundo plano para não segurar o loop: falha só com erro de proxy, sucesso em qualquer outro caso.
+**Report da proxy (estoque):** toda geração reporta a proxy usada, em segundo plano para não segurar o loop: falha só com erro de proxy, sucesso em qualquer outro caso. A proxy e a taxa de sucesso (`proxyMinRate`, de 0 a 1, no backoffice) são por chave e por solver; zero troca a proxy a cada uso.
 
 ### Taxa de requisições
 
@@ -69,7 +69,7 @@ Fora do erro de proxy, a proxy do estoque é reportada como boa.
 
 ### `external`
 
-- `BackOffice[T]`: `Get` e `Post` em JSON, com Token Bearer opcional. Todos compartilham um único cliente HTTP ajustado para muitas requisições em paralelo.
+- `External[T]`: `Get` e `Post` em JSON, com Token Bearer opcional. Todos compartilham um único cliente HTTP ajustado para muitas requisições em paralelo. `BackOffice` o usa para ler a `Config` e `ProxyProvider`, para pedir e reportar proxies.
 - `SessionManager[T]`: `Save(ctx, key, valor)` faz POST e `Get(ctx, key)` faz GET no path da chave.
 - `Routes`: mapa de chave para path, carregado de um JSON. Assim dá para adicionar chaves sem precisar de deploy:
 
@@ -133,7 +133,6 @@ go test -race ./...
 - **A pensar:** o 403 conta como culpa do solver, mas pode ser o destino bloqueando. Cada solver pode reclassificar com `errKind`.
 - **A pensar:** erro de rede da proxy (conexão recusada no dial) chega como código 0, ou seja, temporário: a proxy não é descartada. Avaliar detectar pelo tipo do erro ou deixar com o solver.
 - **A pensar:** o freio do 429 só vale para o estoque e nunca desce abaixo da taxa de requisições; a geração na hora continua batendo no destino.
-- **Melhoria — pontuação de proxy:** a proxy do estoque é trocada na primeira falha de proxy. Manter taxa de sucesso por proxy e trocar só quando cair, e lembrar quais proxies funcionam melhor com cada solver.
 - **A pensar — segurança da proxy no estoque:** o produto guarda os `Params` com a URL inteira da proxy (`http://user:pass@host:porta`), em texto puro no estoque externo. Avaliar guardar só uma referência à proxy ou cifrar as credenciais.
 - Qualquer falha do estoque externo cai em "resolver na hora"; ainda não se distingue "sem estoque" de "sistema fora".
 - As métricas da escolha adaptativa (`SolverStats`) ainda são por task, não globais. Próxima etapa depois do estoque distribuído: levar para o Redis em `{chave}:solver:<nome>`.
@@ -143,3 +142,5 @@ go test -race ./...
   - A geração na hora passa do limite: `startNow` usa o primeiro solver mesmo com todos cheios, e também quando o Redis falha. Quando não há vaga, avaliar esperar dentro do orçamento de tempo ou devolver erro.
   - O limite é contado por chave (`busyKey(key, solver)`): uma mesma conta usada em várias chaves passa do contrato. Avaliar contar pelo recurso real, compartilhado entre as chaves.
   - Limite automático (cresce com a latência perto da baseline, cai à metade com latência alta ou falhas) só para solvers de capacidade variável; nos de contrato o limite fica fixo e, no máximo, desce quando a API degrada.
+- **A pensar:** `pickStock` dá sonda a todo solver doente com vaga, inclusive com `weight` 0, que o sorteio normal exclui. Avaliar pular os desligados.
+- **A pensar:** `pickStock` escolhe um solver por geração faltante, sem limitar a `ceil(limit × 1s)`. Com demanda alta e solvers sem limite, o excesso é escolhido (com `adaptiveChoice`, a um custo alto) e descartado pelo script de reserva.

@@ -20,6 +20,7 @@ type Config struct {
 	Stock          Stocks       `json:"stock"`
 	SolverLimit    SolverLimits `json:"solverLimit"`
 	AdaptiveChoice bool         `json:"adaptiveChoice"`
+	ProxyMinRate   float64      `json:"proxyMinRate"` // success rate (0 to 1) a proxy needs to stay in use, zero change the proxy always
 }
 
 // SolverLimits maps each key to the concurrent limit of each of its solvers, by solver name.

@@ -109,7 +109,7 @@ func TestStockOne_ErroDeProxyDescartaEReportaFalha(t *testing.T) {
 	if r := env.report(t); r.Success || r.Proxy != proxyURL {
 		t.Errorf("report = %+v, quer falha da proxy %q", r, proxyURL)
 	}
-	if _, ok := env.b.proxies.Load(keyA); ok {
+	if _, ok := env.b.proxies[keyA][keyA]; ok {
 		t.Error("proxy com erro continua em uso")
 	}
 	if c := solver.GetStatistic().Snapshot(time.Now()); c.genFailure != 0 {
@@ -131,7 +131,7 @@ func TestStockOne_ErroDoSolverMantemAProxy(t *testing.T) {
 	if r := env.report(t); !r.Success {
 		t.Errorf("report = %+v, erro que não é de proxy reporta a proxy como boa", r)
 	}
-	if p, _ := env.b.proxies.Load(keyA); p != proxyURL {
+	if p := env.b.proxies[keyA][keyA].proxy; p != proxyURL {
 		t.Errorf("proxy em uso = %v, quer %q", p, proxyURL)
 	}
 	if c := solver.GetStatistic().Snapshot(time.Now()); c.genFailure < 0.99 { // decai um pouco até o Snapshot

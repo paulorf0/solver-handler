@@ -10,6 +10,7 @@ type Params struct {
 // ProxyInfo is what the proxy provider returns; only Proxy is read here.
 type ProxyInfo struct {
 	Proxy string `json:"proxy"`
+	Name  string `json:"name"` // Provider name
 }
 
 // Request is what a client asks for. Key picks the solvers; Labels are free attributes

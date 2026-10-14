@@ -28,9 +28,11 @@ type BucketHandler struct {
 	id    string       // identifies this task in the inflight marks
 	seq   atomic.Int64 // numbers the stock reservations of this task
 
-	states  sync.Map // key -> []solverState, refreshed by every stock tick
-	proxies sync.Map // key -> string, proxy the stock of the key uses until it fails
-	probes  sync.Map // key/solver -> *probeState
+	states sync.Map // key -> []solverState, refreshed by every stock tick
+	probes sync.Map // key/solver -> *probeState
+
+	proxiesMu sync.Mutex
+	proxies   map[string]map[string]ProxyStats // key -> solver name -> proxy the stock uses until it fails
 }
 
 func NewBucketHandler() *BucketHandler {
