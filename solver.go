@@ -21,6 +21,8 @@ func (i Info) kind() external.ErrKind {
 		return external.KindUnset
 	case i.errKind != external.KindUnset:
 		return i.errKind
+	case external.IsProxyErr(i.err):
+		return external.KindProxy
 	}
 	return external.KindOf(i.errCode)
 }

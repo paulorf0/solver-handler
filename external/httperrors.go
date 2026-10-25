@@ -1,6 +1,11 @@
 package external
 
-import "errors"
+import (
+	"context"
+	"crypto/tls"
+	"errors"
+	"net"
+)
 
 // Common errors when talking to an external system.
 var (
@@ -54,6 +59,24 @@ var codeKind = map[int]ErrKind{
 	502: KindTemporary,
 	503: KindTemporary,
 	504: KindTemporary,
+}
+
+// IsProxyErr tells whether err is a connection failure (dial, DNS or TLS). Context errors are not.
+func IsProxyErr(err error) bool {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	var opErr *net.OpError
+	var dnsErr *net.DNSError
+	var tlsErr *tls.CertificateVerificationError
+	return errors.Is(err, ErrConnRefused) ||
+		errors.Is(err, ErrConnReset) ||
+		errors.Is(err, ErrDNS) ||
+		errors.Is(err, ErrTLS) ||
+		errors.Is(err, ErrNetworkUnreachable) ||
+		(errors.As(err, &opErr) && opErr.Op == "dial") ||
+		errors.As(err, &dnsErr) ||
+		errors.As(err, &tlsErr)
 }
 
 // KindOf returns the kind of a failure with the given http code.

@@ -44,7 +44,7 @@ Definida por `adaptiveChoice` na config do backoffice:
 |---|---|---|---|---|
 | solver | os não listados | sim | sim | conta como falha nas métricas locais e no Redis (saúde e disjuntor) |
 | temporário | 0, 502, 503, 504 | não | sim | — |
-| proxy | 407 | não | não | reportada como ruim; a proxy do estoque é descartada se a taxa de sucesso está abaixo de `proxyMinRate` |
+| proxy | 407, ou erro de conexão em `Info.err` (`external.IsProxyErr`: falha de dial, DNS, TLS ou os `Err*` de rede) | não | não | reportada como ruim; a proxy do estoque é descartada se a taxa de sucesso está abaixo de `proxyMinRate` |
 | limite do destino | 429 | não | não | conta em `{chave}:gen` (`throttled`) e freia o estoque da chave (abaixo) |
 | cliente | 400, 422 | não | não | — |
 
@@ -122,6 +122,11 @@ go vet ./...
 go test -race ./...
 ```
 
+## Feitos agora, para avaliação
+- **A pensar:** erro de rede da proxy (conexão recusada no dial) chega como código 0, ou seja, temporário: a proxy não é descartada. Avaliar detectar pelo tipo do erro ou deixar com o solver.
+
+- **A pensar:** o freio do 429 só vale para o estoque e nunca desce abaixo da taxa de requisições; a geração na hora continua batendo no destino.
+
 ## Pendências conhecidas
 
 - `main()` vazio: falta iniciar o `BucketHandler`, o `SessionManager`, o `Logs.Run` e o servidor `tcpapi`.
@@ -131,8 +136,6 @@ go test -race ./...
 - **A pensar:** com a meia-vida de 5 min, o timeout fica apertado em demanda muito baixa (~5% de cortes a 0,5 rpm). Avaliar timeout máximo enquanto `w < 20` ou correção de Bessel no desvio.
 - **A pensar:** erro sem código e sem classe (`errCode` 0) é temporário e nunca pune o solver. Um solver que falha sempre assim não perde tráfego nem fica doente; ele deve preencher `errKind`.
 - **A pensar:** o 403 conta como culpa do solver, mas pode ser o destino bloqueando. Cada solver pode reclassificar com `errKind`.
-- **A pensar:** erro de rede da proxy (conexão recusada no dial) chega como código 0, ou seja, temporário: a proxy não é descartada. Avaliar detectar pelo tipo do erro ou deixar com o solver.
-- **A pensar:** o freio do 429 só vale para o estoque e nunca desce abaixo da taxa de requisições; a geração na hora continua batendo no destino.
 - **A pensar — segurança da proxy no estoque:** o produto guarda os `Params` com a URL inteira da proxy (`http://user:pass@host:porta`), em texto puro no estoque externo. Avaliar guardar só uma referência à proxy ou cifrar as credenciais.
 - Qualquer falha do estoque externo cai em "resolver na hora"; ainda não se distingue "sem estoque" de "sistema fora".
 - As métricas da escolha adaptativa (`SolverStats`) ainda são por task, não globais. Próxima etapa depois do estoque distribuído: levar para o Redis em `{chave}:solver:<nome>`.
